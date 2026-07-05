@@ -192,6 +192,25 @@ The provider profile also honors two Hermes-side env vars:
 - `CLAUDE_CODE_CLI_API_KEY` — the placeholder key Hermes stores (ignored by the
   shim).
 
+### Per-request overrides
+
+The env vars above are process-wide defaults. A single request may override
+`--effort`, `--max-turns`, and (in engine mode) the tool allow/deny lists
+without restarting the shim — so main turns and individual auxiliary tasks can
+use different settings concurrently. Any field the request omits falls back to
+the env default. Hermes surfaces these via a task's `extra_body` (e.g.
+`auxiliary.<task>.extra_body`); the model id already overrides `--model`.
+
+| Request field | Maps to | Notes |
+|---|---|---|
+| `reasoning_effort` (top-level) or `extra_body.reasoning.effort` or `extra_body.effort` | `--effort` | Top-level wins over `extra_body`. |
+| `extra_body.max_turns` or top-level `max_turns` | `--max-turns` | Positive integer (int or digit string); `extra_body` wins. |
+| `extra_body.allowed_tools` | `--allowedTools` (engine mode) | CSV string, list of names, or OpenAI tool objects (`{"function":{"name":...}}`); de-duplicated. |
+| `extra_body.disallowed_tools` | `--disallowedTools` (both modes) | CSV string or list. |
+
+Parsing is defensive: a malformed or empty field is ignored (falls back to the
+env default) rather than failing the request.
+
 ### Changing the port
 
 Update both sides so they agree:

@@ -36,6 +36,16 @@ Configuration (environment variables)
     CLAUDE_CODE_CLI_MAX_TURNS      --max-turns          (default 12)
     CLAUDE_CODE_CLI_TIMEOUT        per-request seconds  (default 600)
     CLAUDE_CODE_CLI_EXTRA_ARGS     extra argv, shlex    (default unset)
+
+Per-request overrides (OpenAI request body)
+-------------------------------------------
+A single request may tune effort / max-turns / the tool allowlist without
+restarting the server; each field falls back to the env default above when the
+request omits it (see ``extract_overrides``):
+    extra_body.reasoning.effort   -> --effort   (or top-level reasoning_effort)
+    extra_body.max_turns          -> --max-turns
+    extra_body.allowed_tools      -> --allowedTools   (engine mode; CSV or list)
+    extra_body.disallowed_tools   -> --disallowedTools
 """
 from __future__ import annotations
 
@@ -189,13 +199,102 @@ def flatten_messages(messages: list[dict]) -> str:
 DEFAULT_ENGINE_TOOLS = "Read,Write,Edit,Bash,Glob,Grep,WebFetch,WebSearch,TodoWrite"
 
 
-def build_claude_argv(model: str, engine: bool) -> list[str]:
+def _coerce_tool_list(value) -> str:
+    """Coerce an allow/deny tools value into claude's CSV form.
+
+    Accepts a CSV string (returned trimmed) or a list. List items may be plain
+    tool-name strings or OpenAI ``{"type":"function","function":{"name":...}}``
+    tool objects; the function name is extracted from the latter. Returns ``""``
+    when nothing usable is present.
+    """
+    if isinstance(value, str):
+        return ",".join(part.strip() for part in value.split(",") if part.strip())
+    if isinstance(value, list):
+        names: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                name = item.strip()
+            elif isinstance(item, dict):
+                fn = item.get("function")
+                if isinstance(fn, dict):
+                    name = str(fn.get("name") or "").strip()
+                else:
+                    name = str(item.get("name") or "").strip()
+            else:
+                name = ""
+            if name and name not in names:
+                names.append(name)
+        return ",".join(names)
+    return ""
+
+
+def extract_overrides(body: object) -> dict:
+    """Pull per-request CLI overrides out of an OpenAI request body.
+
+    Only keys that are actually present (and non-empty) are returned, so callers
+    can treat a missing key as "fall back to the env default". This is parsed
+    defensively — a malformed field is ignored rather than raising, keeping a
+    single bad request from breaking the shim. Recognised inputs:
+
+    * ``reasoning_effort`` (top-level) or ``extra_body.reasoning.effort``
+      or ``extra_body.effort``                       -> ``effort``
+    * ``extra_body.max_turns`` / top-level ``max_turns`` (int or str) -> ``max_turns``
+    * ``extra_body.allowed_tools`` (CSV/list/tool-objects)  -> ``allowed_tools``
+    * ``extra_body.disallowed_tools`` (CSV/list)            -> ``disallowed_tools``
+    """
+    if not isinstance(body, dict):
+        return {}
+    extra = body.get("extra_body")
+    if not isinstance(extra, dict):
+        extra = {}
+
+    out: dict = {}
+
+    # --- effort: top-level reasoning_effort, then extra_body.reasoning.effort ---
+    effort = body.get("reasoning_effort")
+    if not (isinstance(effort, str) and effort.strip()):
+        reasoning = extra.get("reasoning")
+        if isinstance(reasoning, dict):
+            effort = reasoning.get("effort")
+        else:
+            effort = extra.get("reasoning_effort") or extra.get("effort")
+    if isinstance(effort, str) and effort.strip():
+        out["effort"] = effort.strip()
+
+    # --- max_turns: extra_body first, then top-level; accept int or str ---
+    max_turns = extra.get("max_turns")
+    if max_turns is None:
+        max_turns = body.get("max_turns")
+    if isinstance(max_turns, bool):
+        max_turns = None  # guard: bool is an int subclass
+    if isinstance(max_turns, int) and max_turns > 0:
+        out["max_turns"] = str(max_turns)
+    elif isinstance(max_turns, str) and max_turns.strip().isdigit() and int(max_turns.strip()) > 0:
+        out["max_turns"] = max_turns.strip()
+
+    # --- tool allow / deny lists (engine mode) ---
+    allowed = _coerce_tool_list(extra.get("allowed_tools"))
+    if allowed:
+        out["allowed_tools"] = allowed
+    disallowed = _coerce_tool_list(extra.get("disallowed_tools"))
+    if disallowed:
+        out["disallowed_tools"] = disallowed
+
+    return out
+
+
+def build_claude_argv(model: str, engine: bool, overrides: dict | None = None) -> list[str]:
     """Assemble the `claude -p` argv from config. Prompt is piped via stdin.
 
     engine=True  → Claude Code uses its OWN tools to actually do the work
                    (read/edit files, run bash) — "use Claude Code as an engine".
     engine=False → no tools, single turn — a plain text model (aux tasks).
+
+    ``overrides`` (from :func:`extract_overrides`) lets a single request tune
+    effort / max-turns / tool lists; any key it omits falls back to the env
+    default, so behavior is unchanged when the request carries no overrides.
     """
+    overrides = overrides or {}
     argv = [
         resolve_claude_bin(),
         "-p",
@@ -204,37 +303,52 @@ def build_claude_argv(model: str, engine: bool) -> list[str]:
         "--no-session-persistence",
     ]
 
-    effort = _env("CLAUDE_CODE_CLI_EFFORT", "high").strip()
+    effort = str(overrides.get("effort") or _env("CLAUDE_CODE_CLI_EFFORT", "high")).strip()
     if effort:
         argv += ["--effort", effort]
 
     if engine:
         # Let the CLI's own agentic tool loop run. Pre-approve a capable tool set
         # so it executes autonomously instead of blocking on permission prompts.
-        tools = _env("CLAUDE_CODE_CLI_ENGINE_TOOLS", DEFAULT_ENGINE_TOOLS).strip()
+        tools = str(
+            overrides.get("allowed_tools")
+            or _env("CLAUDE_CODE_CLI_ENGINE_TOOLS", DEFAULT_ENGINE_TOOLS)
+        ).strip()
         if tools:
             argv += ["--allowedTools", tools]
         if _env("CLAUDE_CODE_CLI_ENGINE_PERMISSION", "").strip().lower() in {
             "bypass", "skip", "dangerous", "yolo",
         }:
             argv += ["--dangerously-skip-permissions"]
-        disallowed = _env("CLAUDE_CODE_CLI_DISALLOWED_TOOLS", "").strip()
+        disallowed = str(
+            overrides.get("disallowed_tools")
+            or _env("CLAUDE_CODE_CLI_DISALLOWED_TOOLS", "")
+        ).strip()
         if disallowed:
             argv += ["--disallowedTools", disallowed]
         add_dir = _env("CLAUDE_CODE_CLI_ADD_DIR", "").strip()
         if add_dir:
             argv += ["--add-dir", *add_dir.split(os.pathsep)]
-        max_turns = _env("CLAUDE_CODE_CLI_ENGINE_MAX_TURNS", "40").strip()
+        max_turns = str(
+            overrides.get("max_turns")
+            or _env("CLAUDE_CODE_CLI_ENGINE_MAX_TURNS", "40")
+        ).strip()
         if max_turns:
             argv += ["--max-turns", max_turns]
     else:
         # Disable the CLI's own tool loop so it behaves as a pure text model
         # (Hermes auxiliary tasks: title-gen, compression, etc.).
         argv += ["--tools", _env("CLAUDE_CODE_CLI_TOOLS", "")]
-        disallowed = _env("CLAUDE_CODE_CLI_DISALLOWED_TOOLS", "").strip()
+        disallowed = str(
+            overrides.get("disallowed_tools")
+            or _env("CLAUDE_CODE_CLI_DISALLOWED_TOOLS", "")
+        ).strip()
         if disallowed:
             argv += ["--disallowedTools", disallowed]
-        max_turns = _env("CLAUDE_CODE_CLI_MAX_TURNS", "12").strip()
+        max_turns = str(
+            overrides.get("max_turns")
+            or _env("CLAUDE_CODE_CLI_MAX_TURNS", "12")
+        ).strip()
         if max_turns:
             argv += ["--max-turns", max_turns]
 
@@ -276,7 +390,7 @@ def _extract_json_object(text: str) -> dict | None:
         return None
 
 
-def run_claude(prompt: str, model: str, engine: bool = False) -> dict:
+def run_claude(prompt: str, model: str, engine: bool = False, overrides: dict | None = None) -> dict:
     """Invoke `claude -p` and return {text, usage, error}.
 
     `usage` is {prompt_tokens, completion_tokens, total_tokens}. On any failure
@@ -284,7 +398,7 @@ def run_claude(prompt: str, model: str, engine: bool = False) -> dict:
     streaming clients still see something. In engine mode the CLI runs its own
     tools in CLAUDE_CODE_CLI_CWD and may take much longer.
     """
-    argv = build_claude_argv(model, engine)
+    argv = build_claude_argv(model, engine, overrides)
     default_timeout = "1200" if engine else "600"
     try:
         timeout = int(_env("CLAUDE_CODE_CLI_TIMEOUT", default_timeout))
@@ -490,10 +604,12 @@ class Handler(BaseHTTPRequestHandler):
                 "them to actually carry out the task — read/modify files, run commands — then "
                 "report what you did. Do not ask for permission; act."
             )
+        overrides = extract_overrides(body)
         started = time.time()
-        outcome = run_claude(prompt, model, engine)
+        outcome = run_claude(prompt, model, engine, overrides)
         self.log_message(
-            "model=%s engine=%s stream=%s %.1fs %s", model, engine, stream,
+            "model=%s engine=%s stream=%s effort=%s %.1fs %s", model, engine, stream,
+            overrides.get("effort") or _env("CLAUDE_CODE_CLI_EFFORT", "high"),
             time.time() - started, "error" if outcome["error"] else "ok",
         )
 

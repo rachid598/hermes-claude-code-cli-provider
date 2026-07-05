@@ -232,5 +232,162 @@ print(json.dumps({"result": "hello from fake http", "usage": {"input_tokens": 1,
             thread.join(timeout=5)
 
 
+class PerRequestOverrideTests(unittest.TestCase):
+    """Issue #5: a single request can override effort / max-turns / tool lists,
+    while an omitted field falls back to the env default."""
+
+    # ---- extract_overrides: effort resolution order ----
+    def test_effort_from_top_level_reasoning_effort(self):
+        self.assertEqual(
+            server.extract_overrides({"reasoning_effort": "low"}).get("effort"), "low"
+        )
+
+    def test_effort_from_extra_body_reasoning_effort(self):
+        body = {"extra_body": {"reasoning": {"effort": "medium"}}}
+        self.assertEqual(server.extract_overrides(body).get("effort"), "medium")
+
+    def test_effort_from_extra_body_flat_effort(self):
+        self.assertEqual(
+            server.extract_overrides({"extra_body": {"effort": "high"}}).get("effort"),
+            "high",
+        )
+
+    def test_top_level_effort_wins_over_extra_body(self):
+        body = {"reasoning_effort": "low", "extra_body": {"reasoning": {"effort": "high"}}}
+        self.assertEqual(server.extract_overrides(body).get("effort"), "low")
+
+    def test_blank_effort_is_ignored(self):
+        self.assertNotIn("effort", server.extract_overrides({"reasoning_effort": "  "}))
+
+    # ---- extract_overrides: max_turns typing / boundaries ----
+    def test_max_turns_accepts_int_and_digit_string(self):
+        self.assertEqual(server.extract_overrides({"extra_body": {"max_turns": 9}})["max_turns"], "9")
+        self.assertEqual(server.extract_overrides({"max_turns": "15"})["max_turns"], "15")
+
+    def test_max_turns_extra_body_wins_over_top_level(self):
+        body = {"max_turns": 3, "extra_body": {"max_turns": 7}}
+        self.assertEqual(server.extract_overrides(body)["max_turns"], "7")
+
+    def test_max_turns_bool_is_rejected(self):
+        # bool is an int subclass — must not leak True/False as "1"/"0".
+        self.assertNotIn("max_turns", server.extract_overrides({"extra_body": {"max_turns": True}}))
+
+    def test_max_turns_negative_and_nonnumeric_rejected(self):
+        self.assertNotIn("max_turns", server.extract_overrides({"extra_body": {"max_turns": "-4"}}))
+        self.assertNotIn("max_turns", server.extract_overrides({"extra_body": {"max_turns": -4}}))
+        self.assertNotIn("max_turns", server.extract_overrides({"extra_body": {"max_turns": "lots"}}))
+        self.assertNotIn("max_turns", server.extract_overrides({"extra_body": {"max_turns": 2.5}}))
+
+    # ---- extract_overrides: tool lists in all shapes ----
+    def test_allowed_tools_from_csv_string(self):
+        body = {"extra_body": {"allowed_tools": " Read , Bash ,, Grep "}}
+        self.assertEqual(server.extract_overrides(body)["allowed_tools"], "Read,Bash,Grep")
+
+    def test_allowed_tools_from_list_of_names(self):
+        body = {"extra_body": {"allowed_tools": ["Read", "Bash", "Read"]}}  # dedup
+        self.assertEqual(server.extract_overrides(body)["allowed_tools"], "Read,Bash")
+
+    def test_allowed_tools_from_openai_tool_objects(self):
+        body = {"extra_body": {"allowed_tools": [
+            {"type": "function", "function": {"name": "Read"}},
+            {"name": "Grep"},
+            {"type": "function", "function": {}},  # nameless → skipped
+        ]}}
+        self.assertEqual(server.extract_overrides(body)["allowed_tools"], "Read,Grep")
+
+    def test_disallowed_tools_passthrough(self):
+        body = {"extra_body": {"disallowed_tools": ["Bash", "Write"]}}
+        self.assertEqual(server.extract_overrides(body)["disallowed_tools"], "Bash,Write")
+
+    def test_empty_tool_list_is_ignored(self):
+        self.assertNotIn("allowed_tools", server.extract_overrides({"extra_body": {"allowed_tools": []}}))
+        self.assertNotIn("allowed_tools", server.extract_overrides({"extra_body": {"allowed_tools": "  "}}))
+
+    # ---- extract_overrides: defensive / malformed inputs never raise ----
+    def test_non_dict_body_and_extra_body_return_empty(self):
+        self.assertEqual(server.extract_overrides(None), {})
+        self.assertEqual(server.extract_overrides([1, 2, 3]), {})
+        self.assertEqual(server.extract_overrides({"extra_body": "nope"}), {})
+        self.assertEqual(server.extract_overrides({}), {})
+
+    # ---- build_claude_argv: overrides win, omissions fall back to env ----
+    def test_override_effort_beats_env_default(self):
+        with temporary_env(CLAUDE_CODE_CLI_BIN="/tmp/fake-claude", CLAUDE_CODE_CLI_EFFORT="high"):
+            argv = server.build_claude_argv("sonnet", engine=False, overrides={"effort": "low"})
+        self.assertEqual(argv[argv.index("--effort") + 1], "low")
+
+    def test_override_max_turns_beats_env_in_both_modes(self):
+        with temporary_env(
+            CLAUDE_CODE_CLI_BIN="/tmp/fake-claude",
+            CLAUDE_CODE_CLI_MAX_TURNS="12",
+            CLAUDE_CODE_CLI_ENGINE_MAX_TURNS="40",
+        ):
+            text_argv = server.build_claude_argv("haiku", engine=False, overrides={"max_turns": "5"})
+            eng_argv = server.build_claude_argv("sonnet", engine=True, overrides={"max_turns": "5"})
+        self.assertEqual(text_argv[text_argv.index("--max-turns") + 1], "5")
+        self.assertEqual(eng_argv[eng_argv.index("--max-turns") + 1], "5")
+
+    def test_override_allowed_and_disallowed_tools_engine_mode(self):
+        with temporary_env(
+            CLAUDE_CODE_CLI_BIN="/tmp/fake-claude",
+            CLAUDE_CODE_CLI_ENGINE_TOOLS="Read,Write,Edit,Bash",
+        ):
+            argv = server.build_claude_argv(
+                "sonnet", engine=True,
+                overrides={"allowed_tools": "Read,Grep", "disallowed_tools": "Bash"},
+            )
+        self.assertEqual(argv[argv.index("--allowedTools") + 1], "Read,Grep")
+        self.assertEqual(argv[argv.index("--disallowedTools") + 1], "Bash")
+
+    def test_empty_overrides_are_byte_identical_to_env_only(self):
+        # Backward compatibility: no overrides ⇒ exactly the pre-#5 argv.
+        with temporary_env(
+            CLAUDE_CODE_CLI_BIN="/tmp/fake-claude",
+            CLAUDE_CODE_CLI_EFFORT="high",
+            CLAUDE_CODE_CLI_MAX_TURNS="12",
+            CLAUDE_CODE_CLI_ENGINE_MAX_TURNS="40",
+            CLAUDE_CODE_CLI_ENGINE_TOOLS="Read,Bash",
+        ):
+            for engine in (False, True):
+                self.assertEqual(
+                    server.build_claude_argv("sonnet", engine=engine),
+                    server.build_claude_argv("sonnet", engine=engine, overrides={}),
+                )
+
+    def test_two_requests_different_effort_produce_different_argv(self):
+        # Issue #5 acceptance criterion (concurrent requests, distinct effort).
+        with temporary_env(CLAUDE_CODE_CLI_BIN="/tmp/fake-claude", CLAUDE_CODE_CLI_EFFORT="high"):
+            a = server.build_claude_argv("sonnet", engine=False,
+                                         overrides=server.extract_overrides({"reasoning_effort": "low"}))
+            b = server.build_claude_argv("sonnet", engine=False,
+                                         overrides=server.extract_overrides({"reasoning_effort": "high"}))
+            default = server.build_claude_argv("sonnet", engine=False,
+                                               overrides=server.extract_overrides({}))
+        self.assertEqual(a[a.index("--effort") + 1], "low")
+        self.assertEqual(b[b.index("--effort") + 1], "high")
+        self.assertNotEqual(a, b)
+        self.assertEqual(default[default.index("--effort") + 1], "high")  # env fallback
+
+    def test_run_claude_threads_overrides_into_argv(self):
+        # End-to-end: a fake CLI echoes its own argv so we can assert the
+        # override actually reached the subprocess, not just build_claude_argv.
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({"result": "argv=" + " ".join(sys.argv[1:]), "usage": {"output_tokens": 1}}))
+""")
+            with temporary_env(
+                CLAUDE_CODE_CLI_BIN=str(fake),
+                CLAUDE_CODE_CLI_TIMEOUT="5",
+                CLAUDE_CODE_CLI_EFFORT="high",
+            ):
+                outcome = server.run_claude(
+                    "hi", "haiku", engine=False, overrides={"effort": "minimal"}
+                )
+        self.assertIn("--effort minimal", outcome["text"])
+        self.assertNotIn("--effort high", outcome["text"])
+
+
 if __name__ == "__main__":
     unittest.main()
