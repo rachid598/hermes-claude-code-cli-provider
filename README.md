@@ -1,5 +1,7 @@
 # hermes-claude-code-cli-provider
 
+[![test](https://github.com/Ouroborosrex/hermes-claude-code-cli-provider/actions/workflows/test.yml/badge.svg)](https://github.com/Ouroborosrex/hermes-claude-code-cli-provider/actions/workflows/test.yml)
+
 A local [Hermes](https://github.com/NousResearch/hermes-agent) inference
 **provider** that routes through the **Claude Code CLI** (`claude -p`) instead of
 the Anthropic API — the same way the `fusion-consult` skill drives Claude Code as
@@ -15,7 +17,10 @@ claude-code-cli/
 ├── __init__.py            registers the ProviderProfile (auto-wires into setup)
 ├── plugin.yaml            plugin manifest
 ├── claude_code_server.py  OpenAI-compatible shim that shells out to `claude -p`
+├── autostart.py           best-effort profile-aware shim autostart
 ├── start.sh               launcher for the shim
+├── scripts/               install, test, and fake-smoke helpers
+├── tests/                 fake-Claude and provider-registration tests
 └── README.md              this file
 ```
 
@@ -94,6 +99,18 @@ git clone https://github.com/Ouroborosrex/hermes-claude-code-cli-provider \
   "${HERMES_HOME:-$HOME/.hermes}/plugins/model-providers/claude-code-cli"
 ```
 
+For development from a checkout, symlink the current tree instead:
+
+```bash
+git clone https://github.com/Ouroborosrex/hermes-claude-code-cli-provider
+cd hermes-claude-code-cli-provider
+scripts/install_plugin.sh
+```
+
+Copy `.env.example` entries into your Hermes `.env` if you want explicit local
+settings. `CLAUDE_CODE_CLI_API_KEY=local` is only a placeholder accepted by the
+local shim; it is not sent to Anthropic.
+
 ## Usage
 
 1. **Start the shim** (keep it running):
@@ -137,6 +154,12 @@ git clone https://github.com/Ouroborosrex/hermes-claude-code-cli-provider \
 > `CLAUDE_CODE_CLI_AUTOSTART=0` and start it manually (step 1). If you ever see
 > `APIConnectionError` against `http://127.0.0.1:8765/v1` with autostart off,
 > the shim isn't running.
+>
+> The autostart gate is profile-aware: Hermes sets `HERMES_HOME` before provider
+> plugin discovery, so the plugin reads that profile's `.env` directly before
+> deciding whether to spawn. A profile-local `CLAUDE_CODE_CLI_AUTOSTART=0` is
+> therefore honored even when Hermes has not loaded the profile `.env` into
+> `os.environ` yet.
 
 ## Configuration
 
@@ -183,6 +206,47 @@ export CLAUDE_CODE_CLI_BASE_URL=http://127.0.0.1:9000/v1   # before `hermes mode
 - `GET  /healthz`               — liveness probe
 - `GET  /v1/models`             — advertises `opus` / `sonnet` / `haiku`
 - `POST /v1/chat/completions`   — chat completion (supports `stream: true`)
+
+## Development and tests
+
+The default test path uses a fake `claude` executable, so it does **not** require
+Claude Code authentication and does not spend real Claude usage.
+
+```bash
+scripts/test.sh
+```
+
+For local Hermes-profile validation, use an explicit non-default profile and the
+fake smoke script:
+
+```bash
+# One-time profile setup example. Do not use `hermes profile use` for this.
+hermes profile create claudecli --clone --no-alias \
+  --description "Claude Code CLI provider smoke profile"
+HERMES_HOME="$HOME/.hermes/profiles/claudecli" scripts/install_plugin.sh
+
+# Configure that profile to call the fake-smoke port.
+hermes -p claudecli config set model.provider claude-code-cli
+hermes -p claudecli config set model.default haiku
+hermes -p claudecli config set model.base_url http://127.0.0.1:8799/v1
+hermes -p claudecli config set model.api_key '${CLAUDE_CODE_CLI_API_KEY}'
+```
+
+Then run:
+
+```bash
+scripts/smoke_fake_hermes_profile.sh claudecli
+scripts/check_clean_runtime.sh
+```
+
+That smoke starts this repo's shim against a temporary fake `claude` binary,
+runs `hermes -p claudecli chat ... --provider claude-code-cli`, asserts the
+`FAKE_CLAUDE_PROFILE_SMOKE_OK` sentinel, and tears the shim down. It also guards
+against accidentally starting the real default shim on port `8765`.
+
+Real Claude Code integration tests should remain opt-in. Run the fake tests and
+fake profile smoke first; only run real `claude -p` probes when you explicitly
+intend to exercise a logged-in Claude Code installation.
 
 ## Uninstall
 
