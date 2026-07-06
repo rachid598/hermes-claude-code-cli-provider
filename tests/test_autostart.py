@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import pathlib
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -97,6 +98,25 @@ class AutostartTests(unittest.TestCase):
             os.environ["HERMES_HOME"] = str(home)
 
             self.assertFalse(self.autostart._provider_in_use())
+
+    def test_provider_requested_on_cli_argv_counts_as_in_use(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = pathlib.Path(td)
+            write_profile(home, "model:\n  provider: custom:fugu\n", "")
+            os.environ.clear()
+            os.environ["HERMES_HOME"] = str(home)
+            old_argv = sys.argv[:]
+            sys.argv = ["hermes", "chat", "--provider", "claude-code-cli", "-m", "haiku"]
+            try:
+                self.assertTrue(self.autostart._provider_requested_on_argv())
+                self.assertTrue(self.autostart._provider_in_use())
+            finally:
+                sys.argv = old_argv
+
+    def test_provider_requested_on_cli_argv_equals_form_counts_as_in_use(self):
+        self.assertTrue(self.autostart._provider_requested_on_argv([
+            "hermes", "chat", "--provider=cc-cli", "-q", "hello",
+        ]))
 
     def test_profile_env_honors_export_prefixed_disable_flag(self):
         # python-dotenv accepts `export KEY=VALUE`; the autostart gate must too,

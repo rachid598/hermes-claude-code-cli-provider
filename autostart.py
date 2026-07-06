@@ -116,13 +116,31 @@ def _is_up(host: str, port: int, timeout: float = 0.4) -> bool:
         return False
 
 
-def _provider_in_use() -> bool:
-    """Cheap text scan: is claude-code-cli referenced as a provider in config?
+def _provider_requested_on_argv(argv: list[str] | None = None) -> bool:
+    """Return true when this process was invoked with --provider <alias>."""
+    args = list(sys.argv if argv is None else argv)
+    for idx, arg in enumerate(args):
+        if not isinstance(arg, str):
+            continue
+        value = ""
+        if arg == "--provider" and idx + 1 < len(args):
+            value = str(args[idx + 1])
+        elif arg.startswith("--provider="):
+            value = arg.split("=", 1)[1]
+        value = value.strip().strip("'\"")
+        if value in PROVIDER_NAMES:
+            return True
+    return False
 
-    Erring toward not spawning when config is unreadable keeps unrelated Hermes
-    invocations (doctor, --version, sandboxed subprocesses) from launching a
-    server they don't need.
-    """
+
+def _provider_in_use() -> bool:
+    """Is claude-code-cli selected by config or by this CLI invocation?"""
+    # Real CLI one-shots often use `hermes chat --provider claude-code-cli ...`
+    # without changing config.yaml. Provider discovery imports this plugin before
+    # the conversation starts, so sys.argv is the only signal available at the
+    # autostart gate for that path.
+    if _provider_requested_on_argv():
+        return True
     try:
         text = (hermes_home() / "config.yaml").read_text(encoding="utf-8", errors="replace")
     except OSError:
