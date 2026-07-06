@@ -1,106 +1,45 @@
-# hermes-claude-code-cli-provider
+# Claude Code CLI Provider for Hermes
 
-[![test](https://github.com/Ouroborosrex/hermes-claude-code-cli-provider/actions/workflows/test.yml/badge.svg)](https://github.com/Ouroborosrex/hermes-claude-code-cli-provider/actions/workflows/test.yml)
+[![CI](https://github.com/Ouroborosrex/hermes-claude-code-cli-provider/actions/workflows/test.yml/badge.svg)](https://github.com/Ouroborosrex/hermes-claude-code-cli-provider/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
+[![Hermes](https://img.shields.io/badge/Hermes-model%20provider-6f42c1.svg)](https://github.com/NousResearch/hermes-agent)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-CLI-orange.svg)](https://docs.claude.com/en/docs/claude-code)
+[![API](https://img.shields.io/badge/API-OpenAI%20Chat%20Completions-green.svg)](#endpoints)
+[![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)](#managed-service)
+[![Issues](https://img.shields.io/github/issues/Ouroborosrex/hermes-claude-code-cli-provider.svg)](https://github.com/Ouroborosrex/hermes-claude-code-cli-provider/issues)
+[![Last commit](https://img.shields.io/github/last-commit/Ouroborosrex/hermes-claude-code-cli-provider.svg)](https://github.com/Ouroborosrex/hermes-claude-code-cli-provider/commits/main)
 
-A local [Hermes](https://github.com/NousResearch/hermes-agent) inference
-**provider** that routes through the **Claude Code CLI** (`claude -p`) instead of
-the Anthropic API — the same way the `fusion-consult` skill drives Claude Code as
-an advisory worker. No Anthropic API key and no network egress: it reuses your
-existing local `claude` login.
+A local [Hermes](https://github.com/NousResearch/hermes-agent) model-provider plugin that exposes the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) through an OpenAI-compatible Chat Completions shim. Hermes talks to `http://127.0.0.1:8765/v1`, and the shim runs `claude -p` using the local Claude Code login. No Anthropic API key is stored in Hermes.
 
-It ships as a Hermes **user plugin** plus a tiny OpenAI-compatible shim, so it
-adds the provider without editing any bundled `hermes-agent` code and is removed
-by deleting one directory.
+Use it for local Claude Code powered chat, advisory work, streaming, vision inputs, and one-shot engine-mode tasks. Hermes-native tool event streaming and interactive permission bridging require deeper Hermes core integration and are tracked separately.
 
-```
-claude-code-cli/
-├── __init__.py            registers the ProviderProfile (auto-wires into setup)
-├── plugin.yaml            plugin manifest
-├── claude_code_server.py  OpenAI-compatible shim that shells out to `claude -p`
-├── autostart.py           best-effort profile-aware shim autostart
-├── start.sh               launcher for the shim
-├── service/               optional systemd/launchd service templates
-├── scripts/               install, service, test, and fake-smoke helpers
-├── tests/                 fake-Claude and provider-registration tests
-└── README.md              this file
-```
+## Features
 
-## How it works
-
-```
-Hermes agent
-  └─ chat_completions transport  ──HTTP──▶  claude_code_server.py (127.0.0.1:8765)
-                                                  └─ claude -p --output-format json
-                                                        └─ returns {"result": "..."}
-                                              ◀── OpenAI chat.completion ──┘
-```
-
-The profile declares `auth_type="api_key"` with a non-empty `env_vars`, so the
-Hermes registry folds it into `CANONICAL_PROVIDERS` (the `hermes setup` /
-`hermes model` picker) and `PROVIDER_REGISTRY` (the credential/model flow)
-automatically. The transport just sees an ordinary OpenAI-compatible endpoint at
-`http://127.0.0.1:8765/v1`; the shim turns each request into a `claude -p`
-subprocess.
-
-## Engine mode — use Claude Code as the engine
-
-`claude -p` is itself a complete agent that runs its **own** tool loop. The shim
-leans into that: when a request carries tool definitions (an agentic Hermes
-turn), it runs Claude Code with its **own** tools enabled (`Read`, `Write`,
-`Edit`, `Bash`, `Glob`, `Grep`, …) so it actually does the work — reads/edits
-files, runs commands — then returns the result. Requests with no tools (Hermes
-auxiliary tasks: title generation, compression) stay text-only.
-
-This is controlled by `CLAUDE_CODE_CLI_ENGINE` (`auto` by default — engine when
-tools are present; `always`/`never` to force).
-
-**What it gets you:** a working Claude-Code-powered agent, billed to your normal
-Claude Code plan (no API/extra-usage charge).
-
-**What it still is NOT:** the shim returns Claude's **final text**, not
-OpenAI-style `tool_calls`. So Hermes sees the *result*, not step-by-step tool
-events, and it's Claude Code's own tools doing the work — not Hermes' tools. For
-Hermes-orchestrated tool-calling, use the bundled **`anthropic`** provider
-instead (note: third-party API use now draws from paid *extra usage*, not your
-plan).
-
-> ⚠️ **Interactive Hermes features don't work in engine mode.** Because Claude
-> Code owns the loop and runs one autonomous pass per turn, anything that needs
-> Hermes to drive an interactive back-and-forth — **browsing/picking skills,
-> approval prompts, step-by-step Hermes tool use, multi-turn Hermes pickers** —
-> collapses to a one-shot text dump of "what Claude Code could see," with no
-> interactivity. Engine mode is for **autonomous one-shot tasks** ("read the
-> issues", "edit this file"); for interactive Hermes flows use a tool-calling
-> provider. Restoring interactivity on the Claude Code path is the core
-> integration tracked in the project epic (the `claude_stream` `api_mode` + its
-> permission/approval bridge).
-
-> ⚠️ **Engine mode executes autonomously.** It pre-approves a capable tool set
-> (incl. `Bash` and file edits) via `--allowedTools`, so it will modify files
-> and run commands without prompting, **inside `CLAUDE_CODE_CLI_CWD`** (default:
-> your home directory). For project work, set `CLAUDE_CODE_CLI_CWD` to the repo
-> and restart the shim. Restrict the toolset with `CLAUDE_CODE_CLI_ENGINE_TOOLS`
-> (e.g. `Read,Grep,Glob` for read-only), or set `CLAUDE_CODE_CLI_ENGINE=never`
-> to keep the provider text-only.
+- User plugin for Hermes. No changes to bundled Hermes code.
+- Local OpenAI-compatible `/v1/chat/completions` and `/v1/models` endpoints.
+- Optional autostart plus managed `systemd --user` and macOS LaunchAgent support.
+- Live Claude Code `stream-json` to OpenAI Server-Sent Events translation.
+- Bounded image passthrough for OpenAI `image_url` content parts.
+- Engine mode for autonomous one-shot Claude Code tool use.
+- Fake-Claude test harness that does not require Claude Code authentication.
 
 ## Requirements
 
-- [Hermes](https://github.com/NousResearch/hermes-agent) installed (`hermes` CLI).
-- The [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) (`claude`)
-  installed and logged in.
-- Python 3 (standard library only — the shim has no dependencies).
+- Hermes Agent CLI.
+- Claude Code CLI installed and logged in.
+- Python 3.11 or newer. CI covers Python 3.11, 3.12, and 3.13.
 
 ## Install
 
-Clone (or copy) this repo into your Hermes plugins directory as
-`claude-code-cli`:
+Install into the active Hermes home:
 
 ```bash
 git clone https://github.com/Ouroborosrex/hermes-claude-code-cli-provider \
   "${HERMES_HOME:-$HOME/.hermes}/plugins/model-providers/claude-code-cli"
 ```
 
-For development from a checkout, symlink the current tree instead:
+For development from a checkout, use the symlink installer:
 
 ```bash
 git clone https://github.com/Ouroborosrex/hermes-claude-code-cli-provider
@@ -108,231 +47,132 @@ cd hermes-claude-code-cli-provider
 scripts/install_plugin.sh
 ```
 
-Copy `.env.example` entries into your Hermes `.env` if you want explicit local
-settings. `CLAUDE_CODE_CLI_API_KEY=local` is only a placeholder accepted by the
-local shim; it is not sent to Anthropic.
+Optional: copy entries from `.env.example` into `${HERMES_HOME:-$HOME/.hermes}/.env` if you want explicit local settings.
 
-## Usage
+## Start the shim
 
-1. **Start the shim** (keep it running):
+```bash
+"${HERMES_HOME:-$HOME/.hermes}/plugins/model-providers/claude-code-cli/start.sh"
+```
 
-   ```bash
-   "${HERMES_HOME:-$HOME/.hermes}/plugins/model-providers/claude-code-cli/start.sh"
-   ```
+Health checks:
 
-   To run it detached so it survives your shell session:
+```bash
+curl -s http://127.0.0.1:8765/healthz
+curl -s http://127.0.0.1:8765/v1/models
+```
 
-   ```bash
-   cd "${HERMES_HOME:-$HOME/.hermes}/plugins/model-providers/claude-code-cli"
-   setsid nohup python3 claude_code_server.py > /tmp/claude-code-cli-shim.log 2>&1 < /dev/null &
-   ```
+### Managed service
 
-   Sanity-check it:
-
-   ```bash
-   curl -s http://127.0.0.1:8765/healthz
-   curl -s http://127.0.0.1:8765/v1/models
-   ```
-
-2. **Select it in Hermes:**
-
-   ```bash
-   hermes setup        # → Inference Provider → "Claude Code (local CLI)"
-   #   or directly:
-   hermes model
-   ```
-
-   - When prompted for `CLAUDE_CODE_CLI_API_KEY`, enter any non-empty
-     placeholder (e.g. `local`) — the shim ignores it. To skip the prompt
-     entirely, export `CLAUDE_CODE_CLI_API_KEY=local` before running setup.
-   - Pick a model: `opus`, `sonnet`, or `haiku` (forwarded verbatim to
-     `claude --model`). If the shim is running, these are listed from
-     `/v1/models`; otherwise just type the name.
-
-> **Auto-start:** when this provider is configured (main model or any auxiliary
-> task), the plugin starts the shim for you on first use if it isn't already
-> listening — so a reboot no longer silently breaks it. Disable with
-> `CLAUDE_CODE_CLI_AUTOSTART=0` and start it manually (step 1). If you ever see
-> `APIConnectionError` against `http://127.0.0.1:8765/v1` with autostart off,
-> the shim isn't running.
->
-> The autostart gate is profile-aware: Hermes sets `HERMES_HOME` before provider
-> plugin discovery, so the plugin reads that profile's `.env` directly before
-> deciding whether to spawn. A profile-local `CLAUDE_CODE_CLI_AUTOSTART=0` is
-> therefore honored even when Hermes has not loaded the profile `.env` into
-> `os.environ` yet.
-
-### Optional managed service
-
-For a reboot/logout-surviving shim, install the opt-in user service instead of
-relying on provider-import autostart:
+To keep the shim running across logout or reboot:
 
 ```bash
 cd "${HERMES_HOME:-$HOME/.hermes}/plugins/model-providers/claude-code-cli"
 scripts/install-service.sh
 ```
 
-- Linux installs and starts a `systemd --user` unit named
-  `claude-code-cli-shim.service`.
-- macOS installs and starts a LaunchAgent named
-  `com.hermes.claude-code-cli-shim`.
-- The installer writes `${HERMES_HOME:-$HOME/.hermes}/claude-code-cli-shim.env`
-  with the host/port/base-url settings and sets `CLAUDE_CODE_CLI_AUTOSTART=0`
-  for the service-managed shim.
+- Linux: installs `claude-code-cli-shim.service` as a `systemd --user` unit.
+- macOS: installs `com.hermes.claude-code-cli-shim` as a LaunchAgent.
+- Remove the service with `scripts/uninstall-service.sh`.
 
-Useful checks:
+## Configure Hermes
+
+Run the model picker and select `Claude Code (local CLI)`:
 
 ```bash
-systemctl --user status claude-code-cli-shim          # Linux
-journalctl --user -u claude-code-cli-shim -n 50      # Linux logs
-launchctl print gui/$(id -u)/com.hermes.claude-code-cli-shim  # macOS
-tail -n 50 "${HERMES_HOME:-$HOME/.hermes}/logs/claude-code-cli-shim.err.log" # macOS logs
+hermes model
 ```
 
-Uninstall the service without removing the plugin:
+When prompted for an API key, enter any non-empty placeholder such as `local`. The shim ignores it, but Hermes expects API-key providers to have a value.
+
+You can also set the common environment values before running `hermes model`:
 
 ```bash
-scripts/uninstall-service.sh
+export CLAUDE_CODE_CLI_API_KEY=local
+export CLAUDE_CODE_CLI_BASE_URL=http://127.0.0.1:8765/v1
+```
+
+Quick smoke check:
+
+```bash
+hermes chat -Q --provider claude-code-cli -m haiku -q "Say hello from Claude Code."
 ```
 
 ## Configuration
 
-The shim reads these environment variables (all optional):
+Most users only need the defaults. See `.env.example` for the full list.
 
 | Variable | Default | Purpose |
-|---|---|---|
-| `CLAUDE_CODE_CLI_HOST` | `127.0.0.1` | Bind host. |
-| `CLAUDE_CODE_CLI_PORT` | `8765` | Bind port. Keep in sync with `base_url`. |
+|---|---:|---|
+| `CLAUDE_CODE_CLI_BASE_URL` | `http://127.0.0.1:8765/v1` | Endpoint Hermes calls. |
+| `CLAUDE_CODE_CLI_API_KEY` | `local` | Placeholder stored by Hermes and ignored by the shim. |
+| `CLAUDE_CODE_CLI_HOST` | `127.0.0.1` | Shim bind host. |
+| `CLAUDE_CODE_CLI_PORT` | `8765` | Shim bind port. |
 | `CLAUDE_CODE_CLI_BIN` | autodetect | Path to the `claude` binary. |
-| `CLAUDE_CODE_CLI_MODEL` | `sonnet` | Fallback model when a request omits one. |
-| `CLAUDE_CODE_CLI_EFFORT` | `high` | `--effort` value (empty string omits it). |
-| `CLAUDE_CODE_CLI_TOOLS` | `""` | Text-mode `--tools` value; empty = no CLI tools. |
-| `CLAUDE_CODE_CLI_DISALLOWED_TOOLS` | _unset_ | `--disallowedTools` value (both modes). |
-| `CLAUDE_CODE_CLI_MAX_TURNS` | `12` | Text-mode `--max-turns`. |
-| `CLAUDE_CODE_CLI_ENGINE` | `auto` | `auto` (engine when request has tools), `always`, or `never`. |
-| `CLAUDE_CODE_CLI_ENGINE_TOOLS` | `Read,Write,Edit,Bash,Glob,Grep,WebFetch,WebSearch,TodoWrite` | Tools pre-approved (`--allowedTools`) in engine mode. |
-| `CLAUDE_CODE_CLI_ENGINE_MAX_TURNS` | `40` | Engine-mode `--max-turns`. |
-| `CLAUDE_CODE_CLI_ENGINE_PERMISSION` | _unset_ | Set to `bypass` to add `--dangerously-skip-permissions`. |
-| `CLAUDE_CODE_CLI_CWD` | `$HOME` | Working directory Claude Code operates in (engine mode). |
-| `CLAUDE_CODE_CLI_ADD_DIR` | _unset_ | Extra dirs (`--add-dir`), `os.pathsep`-separated. |
-| `CLAUDE_CODE_CLI_TIMEOUT` | `600` | Per-request timeout (seconds). |
-| `CLAUDE_CODE_CLI_STREAM` | `1` | For `stream: true`, use live Claude Code `stream-json` events (`0` = legacy buffered chunk). |
-| `CLAUDE_CODE_CLI_VISION` | `1` | Materialize image inputs into Claude-readable temp files / URL refs (`0` = `[image omitted]`). |
-| `CLAUDE_CODE_CLI_MAX_IMAGES` | `8` | Maximum image parts accepted per request. |
-| `CLAUDE_CODE_CLI_MAX_IMAGE_MB` | `20` | Maximum decoded size for each data-URL/base64 image. |
-| `CLAUDE_CODE_CLI_EXTRA_ARGS` | _unset_ | Extra argv appended to every call (shlex-split). |
-| `CLAUDE_CODE_CLI_AUTOSTART` | `1` | Auto-start the shim on first use when this provider is configured (`0`/`false` to disable). |
+| `CLAUDE_CODE_CLI_MODEL` | `sonnet` | Fallback model. |
+| `CLAUDE_CODE_CLI_AUTOSTART` | `1` | Start the shim during provider load when needed. |
+| `CLAUDE_CODE_CLI_ENGINE` | `auto` | `auto`, `always`, or `never`. |
+| `CLAUDE_CODE_CLI_CWD` | `$HOME` | Working directory for Claude Code engine-mode runs. |
+| `CLAUDE_CODE_CLI_ENGINE_TOOLS` | common file and web tools | Tool allowlist for engine mode. |
+| `CLAUDE_CODE_CLI_STREAM` | `1` | Use live `stream-json` for streaming requests. |
+| `CLAUDE_CODE_CLI_VISION` | `1` | Pass image inputs through when possible. |
+| `CLAUDE_CODE_CLI_TIMEOUT` | `600` | Per-request timeout in seconds. |
 
-The provider profile also honors two Hermes-side env vars:
+## Behavior notes
 
-- `CLAUDE_CODE_CLI_BASE_URL` — override the endpoint Hermes calls (default
-  `http://127.0.0.1:8765/v1`). Set this if you change the shim's host/port.
-- `CLAUDE_CODE_CLI_API_KEY` — the placeholder key Hermes stores (ignored by the
-  shim).
+### Engine mode
 
-### Streaming behavior
+`claude -p` is a complete agent with its own tool loop. In `auto` mode, the shim enables engine mode when the Hermes request includes tool definitions. Claude Code then performs the work with its local tools and returns final assistant text.
 
-When a request sets `stream: true`, the shim now invokes Claude Code with
-`--output-format stream-json --verbose --include-partial-messages` and forwards
-text deltas as OpenAI-compatible Server-Sent Events. The final Claude `result`
-event is mapped back to usage metadata when available.
+Engine mode can read files, edit files, and run commands in `CLAUDE_CODE_CLI_CWD`. Set that directory deliberately, restrict tools with `CLAUDE_CODE_CLI_ENGINE_TOOLS`, or use `CLAUDE_CODE_CLI_ENGINE=never` for text-only behavior.
 
-If the CLI only returns a single buffered JSON object (or you set
-`CLAUDE_CODE_CLI_STREAM=0`), the shim falls back to the legacy behavior: one
-content chunk followed by `[DONE]`. This keeps older fake-CLI/test setups and
-unexpected Claude Code output shapes from breaking clients.
+### Streaming
 
-### Vision/image inputs
-
-OpenAI image content parts are no longer silently dropped by default. For data
-URLs/base64 payloads, the shim writes bounded per-request temp files and tells
-Claude Code to read those paths; remote `http(s)` image URLs are passed through
-as URL references. Temp files are removed after the request finishes.
-
-Safety knobs:
-
-- `CLAUDE_CODE_CLI_MAX_IMAGES` limits the number of image parts per request.
-- `CLAUDE_CODE_CLI_MAX_IMAGE_MB` limits each decoded base64/data-URL payload.
-- `CLAUDE_CODE_CLI_VISION=0` restores the old `[image omitted]` behavior.
-
-### Per-request overrides
-
-The env vars above are process-wide defaults. A single request may override
-`--effort`, `--max-turns`, and (in engine mode) the tool allow/deny lists
-without restarting the shim — so main turns and individual auxiliary tasks can
-use different settings concurrently. Any field the request omits falls back to
-the env default. Hermes surfaces these via a task's `extra_body` (e.g.
-`auxiliary.<task>.extra_body`); the model id already overrides `--model`.
-
-| Request field | Maps to | Notes |
-|---|---|---|
-| `reasoning_effort` (top-level) or `extra_body.reasoning.effort` or `extra_body.effort` | `--effort` | Top-level wins over `extra_body`. |
-| `extra_body.max_turns` or top-level `max_turns` | `--max-turns` | Positive integer (int or digit string); `extra_body` wins. |
-| `extra_body.allowed_tools` | `--allowedTools` (engine mode) | CSV string, list of names, or OpenAI tool objects (`{"function":{"name":...}}`); de-duplicated. |
-| `extra_body.disallowed_tools` | `--disallowedTools` (both modes) | CSV string or list. |
-
-Parsing is defensive: a malformed or empty field is ignored (falls back to the
-env default) rather than failing the request.
-
-### Changing the port
-
-Update both sides so they agree:
+For `stream: true`, the shim uses:
 
 ```bash
-CLAUDE_CODE_CLI_PORT=9000 ./start.sh
-export CLAUDE_CODE_CLI_BASE_URL=http://127.0.0.1:9000/v1   # before `hermes model`
+claude -p --output-format stream-json --verbose --include-partial-messages
 ```
+
+Text deltas are forwarded as OpenAI-compatible Server-Sent Events. If Claude Code returns a single buffered JSON object, the shim falls back to one content chunk followed by `[DONE]`.
+
+### Vision inputs
+
+OpenAI `image_url` parts are handled as follows:
+
+- Data URLs and base64 payloads are written to bounded per-request temp files.
+- Remote `http` and `https` URLs are passed through as image references.
+- Temp files are removed after the request finishes.
+- Limits are controlled by `CLAUDE_CODE_CLI_MAX_IMAGES` and `CLAUDE_CODE_CLI_MAX_IMAGE_MB`.
 
 ## Endpoints
 
-- `GET  /healthz`               — liveness probe
-- `GET  /v1/models`             — advertises `opus` / `sonnet` / `haiku`
-- `POST /v1/chat/completions`   — chat completion (supports `stream: true`)
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/healthz` | Liveness check. |
+| `GET` | `/v1/models` | Advertises `opus`, `sonnet`, and `haiku`. |
+| `POST` | `/v1/chat/completions` | Chat completion with optional streaming. |
 
-## Development and tests
+## Development
 
-The default test path uses a fake `claude` executable, so it does **not** require
-Claude Code authentication and does not spend real Claude usage.
+Default tests use a fake `claude` executable. They do not require Claude Code authentication and do not spend Claude usage.
 
 ```bash
 scripts/test.sh
 ```
 
-For local Hermes-profile validation, use an explicit non-default profile and the
-fake smoke script:
+Optional Hermes integration smoke with a disposable profile:
 
 ```bash
-# One-time profile setup example. Do not use `hermes profile use` for this.
-hermes profile create claudecli --clone --no-alias \
-  --description "Claude Code CLI provider smoke profile"
-HERMES_HOME="$HOME/.hermes/profiles/claudecli" scripts/install_plugin.sh
-
-# Configure that profile to call the fake-smoke port.
-hermes -p claudecli config set model.provider claude-code-cli
-hermes -p claudecli config set model.default haiku
-hermes -p claudecli config set model.base_url http://127.0.0.1:8799/v1
-hermes -p claudecli config set model.api_key '${CLAUDE_CODE_CLI_API_KEY}'
-```
-
-Then run:
-
-```bash
-scripts/smoke_fake_hermes_profile.sh claudecli
+scripts/smoke_fake_hermes_profile.sh <profile-name>
 scripts/check_clean_runtime.sh
 ```
 
-That smoke starts this repo's shim against a temporary fake `claude` binary,
-runs `hermes -p claudecli chat ... --provider claude-code-cli`, asserts the
-`FAKE_CLAUDE_PROFILE_SMOKE_OK` sentinel, and tears the shim down. It also guards
-against accidentally starting the real default shim on port `8765`.
-
-Real Claude Code integration tests should remain opt-in. Run the fake tests and
-fake profile smoke first; only run real `claude -p` probes when you explicitly
-intend to exercise a logged-in Claude Code installation.
+Run real Claude Code probes only when you intend to exercise a logged-in Claude Code installation.
 
 ## Uninstall
 
-If you installed the optional managed service, remove it first:
+If you installed the managed service, remove it first:
 
 ```bash
 cd "${HERMES_HOME:-$HOME/.hermes}/plugins/model-providers/claude-code-cli"
@@ -345,8 +185,8 @@ Then remove the plugin:
 rm -rf "${HERMES_HOME:-$HOME/.hermes}/plugins/model-providers/claude-code-cli"
 ```
 
-Finally, re-point your default model away from `claude-code-cli` via `hermes model`.
+Select another Hermes model with `hermes model`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
