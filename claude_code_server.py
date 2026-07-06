@@ -36,6 +36,10 @@ Configuration (environment variables)
     CLAUDE_CODE_CLI_MAX_TURNS      --max-turns          (default 12)
     CLAUDE_CODE_CLI_TIMEOUT        per-request seconds  (default 600)
     CLAUDE_CODE_CLI_EXTRA_ARGS     extra argv, shlex    (default unset)
+    CLAUDE_CODE_CLI_STREAM         real token streaming (default 1; see #3)
+    CLAUDE_CODE_CLI_VISION         pass images to claude(default on;  see #4)
+    CLAUDE_CODE_CLI_MAX_IMAGES     images per request   (default 8)
+    CLAUDE_CODE_CLI_MAX_IMAGE_MB   per-image size cap MB (default 20)
 
 Per-request overrides (OpenAI request body)
 -------------------------------------------
@@ -49,6 +53,7 @@ request omits it (see ``extract_overrides``):
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import pathlib
@@ -57,6 +62,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -128,8 +135,143 @@ def resolve_claude_bin() -> str:
 # --------------------------------------------------------------------------- #
 # Prompt construction + CLI invocation
 # --------------------------------------------------------------------------- #
-def _content_to_text(content) -> str:
-    """Flatten OpenAI message content (str or list-of-parts) to plain text."""
+# Vision passthrough (#4): claude -p is blind to inline OpenAI image parts, so
+# we materialize base64 `data:` images to temp files and reference their paths
+# in the prompt (Claude Code's Read tool can open image files in engine mode).
+# Remote URLs are passed through as text references — the shim intentionally
+# performs no network egress, so it never downloads them itself.
+_DATA_URL_RE = re.compile(
+    r"^data:(?P<mime>[\w.+-]+/[\w.+-]+)?(?P<b64>;base64)?,(?P<data>.*)$", re.DOTALL
+)
+_MIME_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+    "image/svg+xml": ".svg",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+}
+
+
+def _vision_enabled() -> bool:
+    return _env("CLAUDE_CODE_CLI_VISION", "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def _max_images() -> int:
+    try:
+        return max(0, int(_env("CLAUDE_CODE_CLI_MAX_IMAGES", "8")))
+    except ValueError:
+        return 8
+
+
+def _max_image_bytes() -> int:
+    try:
+        mb = float(_env("CLAUDE_CODE_CLI_MAX_IMAGE_MB", "20"))
+    except ValueError:
+        mb = 20.0
+    return int(max(0.0, mb) * 1024 * 1024)
+
+
+def _image_url_from_part(part: dict) -> str | None:
+    """Extract the URL string from an OpenAI ``image_url`` content part.
+
+    Handles both the object form ``{"image_url": {"url": "..."}}`` and the
+    shorthand ``{"image_url": "..."}``.
+    """
+    iu = part.get("image_url")
+    if isinstance(iu, dict):
+        url = iu.get("url")
+        return url if isinstance(url, str) and url.strip() else None
+    if isinstance(iu, str) and iu.strip():
+        return iu
+    return None
+
+
+class _ImageCollector:
+    """Materialize image parts to temp files, bounded by count and size.
+
+    ``add(url)`` returns the prompt text that should stand in for the image and,
+    for decodable ``data:`` URLs, writes a temp file whose path is referenced in
+    that text. Call :meth:`cleanup` after the CLI invocation returns to delete
+    the temp files. When vision is disabled it degrades to ``[image omitted]``,
+    preserving the pre-#4 behavior.
+    """
+
+    def __init__(self) -> None:
+        self.enabled = _vision_enabled()
+        self.max_images = _max_images()
+        self.max_bytes = _max_image_bytes()
+        self.count = 0
+        self.paths: list[str] = []
+        self._dir: str | None = None
+
+    def _tmpdir(self) -> str:
+        if self._dir is None:
+            self._dir = tempfile.mkdtemp(prefix="claude-code-cli-img-")
+        return self._dir
+
+    def add(self, url: str) -> str:
+        if not self.enabled:
+            return "[image omitted]"
+        if self.count >= self.max_images:
+            return f"[image omitted: over the {self.max_images}-image limit]"
+        url = url.strip()
+        m = _DATA_URL_RE.match(url)
+        if m and m.group("b64"):
+            try:
+                raw = base64.b64decode(m.group("data"), validate=False)
+            except Exception:
+                return "[image omitted: undecodable data URL]"
+            if not raw:
+                return "[image omitted: empty image]"
+            if self.max_bytes and len(raw) > self.max_bytes:
+                return f"[image omitted: exceeds {self.max_bytes // (1024 * 1024)}MB cap]"
+            mime = (m.group("mime") or "image/png").lower()
+            ext = _MIME_EXT.get(mime, ".img")
+            path = os.path.join(self._tmpdir(), f"image_{self.count:02d}{ext}")
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(raw)
+            except OSError as exc:
+                return f"[image omitted: {exc}]"
+            self.count += 1
+            self.paths.append(path)
+            return f"[image saved to {path} — read this file to view the image]"
+        # Non-data reference: pass it through as text so an engine-mode agent can
+        # fetch it (WebFetch) if it chooses. The shim itself does not download.
+        if url.startswith(("http://", "https://", "file://", "/")):
+            self.count += 1
+            return f"[image at {url} — fetch this URL/path to view the image]"
+        return "[image omitted: unsupported image reference]"
+
+    def cleanup(self) -> None:
+        for p in self.paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        if self._dir:
+            try:
+                os.rmdir(self._dir)
+            except OSError:
+                pass
+        self.paths = []
+        self._dir = None
+
+
+def _content_to_text(content, images: _ImageCollector | None = None) -> str:
+    """Flatten OpenAI message content (str or list-of-parts) to plain text.
+
+    When ``images`` is provided, ``image_url`` parts are materialized/referenced
+    through the collector (#4); otherwise they degrade to ``[image omitted]`` so
+    text-only callers keep their original behavior.
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -138,8 +280,12 @@ def _content_to_text(content) -> str:
             if isinstance(part, dict):
                 if isinstance(part.get("text"), str):
                     chunks.append(part["text"])
-                elif part.get("type") == "image_url":
-                    chunks.append("[image omitted]")
+                elif part.get("type") == "image_url" or "image_url" in part:
+                    url = _image_url_from_part(part) if images is not None else None
+                    if images is not None and url:
+                        chunks.append(images.add(url))
+                    else:
+                        chunks.append("[image omitted]")
             elif isinstance(part, str):
                 chunks.append(part)
         return "\n".join(chunks)
@@ -148,12 +294,13 @@ def _content_to_text(content) -> str:
     return str(content)
 
 
-def flatten_messages(messages: list[dict]) -> str:
+def flatten_messages(messages: list[dict], images: _ImageCollector | None = None) -> str:
     """Render an OpenAI message list into a single prompt for `claude -p`.
 
     System/developer messages become a leading SYSTEM block; the conversation
     is rendered as labelled turns. Tool messages are folded in as context so
-    nothing in the history is silently dropped.
+    nothing in the history is silently dropped. When an ``images`` collector is
+    passed, inline images are materialized/referenced instead of dropped (#4).
     """
     system_blocks: list[str] = []
     convo: list[str] = []
@@ -161,7 +308,7 @@ def flatten_messages(messages: list[dict]) -> str:
         if not isinstance(msg, dict):
             continue
         role = (msg.get("role") or "user").lower()
-        text = _content_to_text(msg.get("content"))
+        text = _content_to_text(msg.get("content"), images)
         if role in ("system", "developer"):
             if text.strip():
                 system_blocks.append(text)
@@ -283,7 +430,8 @@ def extract_overrides(body: object) -> dict:
     return out
 
 
-def build_claude_argv(model: str, engine: bool, overrides: dict | None = None) -> list[str]:
+def build_claude_argv(model: str, engine: bool, overrides: dict | None = None,
+                      stream: bool = False) -> list[str]:
     """Assemble the `claude -p` argv from config. Prompt is piped via stdin.
 
     engine=True  → Claude Code uses its OWN tools to actually do the work
@@ -293,15 +441,28 @@ def build_claude_argv(model: str, engine: bool, overrides: dict | None = None) -
     ``overrides`` (from :func:`extract_overrides`) lets a single request tune
     effort / max-turns / tool lists; any key it omits falls back to the env
     default, so behavior is unchanged when the request carries no overrides.
+
+    ``stream=True`` (issue #3) switches the output format to ``stream-json`` so
+    the CLI emits incremental JSONL events instead of one final JSON blob;
+    ``--verbose`` is required by the CLI in that mode, and partial (token-level)
+    messages are requested unless ``CLAUDE_CODE_CLI_PARTIAL_MESSAGES`` disables
+    them (an escape hatch for CLI versions that lack the flag).
     """
     overrides = overrides or {}
     argv = [
         resolve_claude_bin(),
         "-p",
         "--model", model,
-        "--output-format", "json",
-        "--no-session-persistence",
     ]
+    if stream:
+        argv += ["--output-format", "stream-json", "--verbose"]
+        if _env("CLAUDE_CODE_CLI_PARTIAL_MESSAGES", "1").strip().lower() not in {
+            "0", "false", "no", "off",
+        }:
+            argv += ["--include-partial-messages"]
+    else:
+        argv += ["--output-format", "json"]
+    argv += ["--no-session-persistence"]
 
     effort = str(overrides.get("effort") or _env("CLAUDE_CODE_CLI_EFFORT", "high")).strip()
     if effort:
@@ -475,6 +636,276 @@ def _map_usage(usage) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Real token streaming (#3): `claude -p --output-format stream-json`
+# --------------------------------------------------------------------------- #
+def _real_streaming_enabled() -> bool:
+    """Whether ``stream:true`` requests use incremental stream-json (#3).
+
+    Default on ("auto"); set CLAUDE_CODE_CLI_STREAM=off to force the legacy
+    run-to-completion-then-one-chunk behavior.
+    """
+    return _env("CLAUDE_CODE_CLI_STREAM", "auto").strip().lower() not in {
+        "0", "false", "no", "off", "buffered", "sync",
+    }
+
+
+def iter_stream_json(lines):
+    """Yield JSON object events from a Claude Code stream-json line source.
+
+    The CLI writes one JSON object per line, but stderr/progress wrappers or
+    future CLI versions may add blank or non-JSON lines. Invalid lines are
+    ignored instead of failing the request, matching the shim's defensive JSON
+    handling elsewhere.
+    """
+    for raw in lines:
+        line = str(raw).strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            yield event
+
+
+def _extract_stream_delta(event: dict) -> str:
+    """Pull an assistant *text* delta out of a stream-json event.
+
+    Defensive against schema drift: accepts Claude Code's wrapped
+    ``{"type":"stream_event","event":...}`` records as well as direct
+    Anthropic-style ``content_block_delta`` records. Only text deltas are
+    forwarded; tool-argument ``input_json_delta`` events and everything else
+    yield ``""``.
+    """
+    inner = event.get("event") if event.get("type") == "stream_event" else event
+    if not isinstance(inner, dict):
+        return ""
+    itype = inner.get("type")
+    if itype == "content_block_delta":
+        delta = inner.get("delta")
+        if isinstance(delta, dict):
+            dtype = delta.get("type")
+            text = delta.get("text")
+            if isinstance(text, str) and dtype in ("text_delta", None):
+                return text
+    elif itype == "content_block_start":
+        block = inner.get("content_block")
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                return text
+    return ""
+
+
+def _extract_assistant_message_text(event: dict) -> str:
+    """Concatenate text blocks from a complete ``assistant`` message event."""
+    msg = event.get("message")
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def _extract_result_event(event: dict):
+    """Return ``(text, usage, error)`` for a terminal event, else ``None``.
+
+    Recognizes the stream-json ``{"type":"result",...}`` event *and*, defensively,
+    a bare ``{"result": ..., "usage": ...}`` blob — some CLI versions ignore
+    ``--output-format stream-json`` and emit a single JSON object, and we still
+    want a usable final result + usage in that case.
+    """
+    is_result_type = event.get("type") == "result"
+    bare_result = event.get("type") is None and isinstance(event.get("result"), str)
+    if not (is_result_type or bare_result):
+        return None
+    if event.get("is_error"):
+        msg = str(event.get("result") or event.get("error") or "claude reported is_error")
+        return ("", _map_usage(event.get("usage")), msg)
+    text = event.get("result")
+    text = text if isinstance(text, str) else str(event.get("content") or "")
+    return (text, _map_usage(event.get("usage")), "")
+
+
+def _kill_proc(proc) -> None:
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def stream_claude(prompt: str, model: str, engine: bool = False,
+                  overrides: dict | None = None):
+    """Generator yielding ``("delta", text)`` as tokens arrive, then exactly one
+    ``("final", {"text","usage","error"})``.
+
+    Invokes ``claude -p --output-format stream-json`` and forwards assistant-text
+    deltas the moment the CLI emits them, so time-to-first-token is the first
+    token rather than the whole generation (issue #3). It never raises: spawn
+    failures, timeouts, and unparseable output are surfaced through the terminal
+    ``final`` outcome, mirroring :func:`run_claude`. The prompt is fed on a
+    thread and stderr drained on a thread to avoid pipe deadlocks.
+    """
+    argv = build_claude_argv(model, engine, overrides, stream=True)
+    default_timeout = "1200" if engine else "600"
+    try:
+        timeout = int(_env("CLAUDE_CODE_CLI_TIMEOUT", default_timeout))
+    except ValueError:
+        timeout = int(default_timeout)
+    cwd = _engine_cwd() if engine else None
+
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=build_subprocess_env(),
+            cwd=cwd,
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        msg = f"claude binary not found (tried {argv[0]!r}); set CLAUDE_CODE_CLI_BIN"
+        yield ("final", {"text": f"[claude-code-cli error] {msg}", "usage": _zero_usage(), "error": msg})
+        return
+    except Exception as exc:  # defensive: never crash the request thread
+        msg = f"claude invocation failed: {exc!r}"
+        yield ("final", {"text": f"[claude-code-cli error] {msg}", "usage": _zero_usage(), "error": msg})
+        return
+
+    def _feed():
+        try:
+            if proc.stdin:
+                proc.stdin.write(prompt)
+                proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    stderr_chunks: list[str] = []
+
+    def _drain_stderr():
+        try:
+            if proc.stderr:
+                for line in proc.stderr:
+                    stderr_chunks.append(line)
+        except Exception:
+            pass
+
+    timed_out = {"flag": False}
+
+    def _watchdog():
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                return
+            time.sleep(0.2)
+        if proc.poll() is None:
+            timed_out["flag"] = True
+            _kill_proc(proc)
+
+    feeder = threading.Thread(target=_feed, daemon=True)
+    err_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    watch = threading.Thread(target=_watchdog, daemon=True)
+    feeder.start()
+    err_thread.start()
+    watch.start()
+
+    emitted_any = False
+    emitted_parts: list[str] = []
+    assistant_text = ""
+    result_text = ""
+    result_usage = _zero_usage()
+    result_error = ""
+    saw_result = False
+
+    try:
+        for event in iter_stream_json(proc.stdout or ()):  # watchdog kills on timeout
+            etype = event.get("type")
+            if etype in {"stream_event", "content_block_delta", "content_block_start"}:
+                delta = _extract_stream_delta(event)
+                if delta:
+                    emitted_any = True
+                    emitted_parts.append(delta)
+                    yield ("delta", delta)
+            elif etype == "assistant":
+                assistant_text = _extract_assistant_message_text(event)
+                if assistant_text and not emitted_any:
+                    # No partial deltas (older CLI / flag off): emit the whole
+                    # assistant message once so the client still streams.
+                    emitted_any = True
+                    emitted_parts.append(assistant_text)
+                    yield ("delta", assistant_text)
+            else:
+                parsed = _extract_result_event(event)
+                if parsed is not None:
+                    result_text, result_usage, result_error = parsed
+                    saw_result = True
+    finally:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            _kill_proc(proc)
+        feeder.join(timeout=1)
+        err_thread.join(timeout=1)
+        watch.join(timeout=1)
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                if pipe:
+                    pipe.close()
+            except Exception:
+                pass
+
+    emitted_text = "".join(emitted_parts)
+    stderr_tail = "".join(stderr_chunks).strip()[-1000:]
+
+    if timed_out["flag"]:
+        msg = f"claude timed out after {timeout}s"
+        text = emitted_text or f"[claude-code-cli error] {msg}"
+        yield ("final", {"text": text, "usage": result_usage, "error": msg})
+        return
+
+    if result_error:
+        if not emitted_any:
+            err_line = f"[claude-code-cli error] {result_error}"
+            emitted_text = err_line
+            yield ("delta", err_line)
+        yield ("final", {"text": emitted_text, "usage": result_usage, "error": result_error})
+        return
+
+    final_text = result_text or emitted_text or assistant_text
+    if not emitted_any and final_text:
+        # Never streamed (e.g. a bare-json CLI) but we have text → emit once.
+        yield ("delta", final_text)
+
+    if not final_text and not saw_result:
+        rc = proc.returncode
+        if rc not in (0, None):
+            msg = f"claude exited {rc}: {stderr_tail}" if stderr_tail else f"claude exited {rc}"
+        else:
+            msg = "claude returned no output"
+        err_line = f"[claude-code-cli error] {msg}"
+        yield ("delta", err_line)
+        yield ("final", {"text": err_line, "usage": _zero_usage(), "error": msg})
+        return
+
+    yield ("final", {"text": final_text, "usage": result_usage, "error": ""})
+
+
+# --------------------------------------------------------------------------- #
 # OpenAI response shaping
 # --------------------------------------------------------------------------- #
 def _completion_id() -> str:
@@ -596,29 +1027,47 @@ class Handler(BaseHTTPRequestHandler):
             _tools = body.get("tools")
             engine = isinstance(_tools, list) and len(_tools) > 0
 
-        prompt = flatten_messages(messages)
-        if engine:
-            prompt += (
-                "\n\nYou are operating as an autonomous coding engine with your own tools "
-                "(Read, Write, Edit, Bash, Glob, Grep, etc.) in your working directory. Use "
-                "them to actually carry out the task — read/modify files, run commands — then "
-                "report what you did. Do not ask for permission; act."
-            )
-        overrides = extract_overrides(body)
-        started = time.time()
-        outcome = run_claude(prompt, model, engine, overrides)
-        self.log_message(
-            "model=%s engine=%s stream=%s effort=%s %.1fs %s", model, engine, stream,
-            overrides.get("effort") or _env("CLAUDE_CODE_CLI_EFFORT", "high"),
-            time.time() - started, "error" if outcome["error"] else "ok",
-        )
+        images = _ImageCollector()
+        try:
+            prompt = flatten_messages(messages, images)
+            if engine:
+                prompt += (
+                    "\n\nYou are operating as an autonomous coding engine with your own tools "
+                    "(Read, Write, Edit, Bash, Glob, Grep, etc.) in your working directory. Use "
+                    "them to actually carry out the task — read/modify files, run commands — then "
+                    "report what you did. Do not ask for permission; act."
+                )
+            overrides = extract_overrides(body)
+            started = time.time()
 
-        if stream:
-            self._stream_response(model, outcome, include_usage)
+            if stream and _real_streaming_enabled():
+                outcome = self._stream_live_response(model, prompt, engine, overrides, include_usage)
+            else:
+                outcome = run_claude(prompt, model, engine, overrides)
+                if stream:
+                    self._stream_response(model, outcome, include_usage)
+                else:
+                    self._send_json(200, build_completion(model, outcome["text"], outcome["usage"]))
+
+            self.log_message(
+                "model=%s engine=%s stream=%s live_stream=%s images=%s effort=%s %.1fs %s",
+                model, engine, stream, bool(stream and _real_streaming_enabled()), images.count,
+                overrides.get("effort") or _env("CLAUDE_CODE_CLI_EFFORT", "high"),
+                time.time() - started, "error" if outcome["error"] else "ok",
+            )
+        finally:
+            images.cleanup()
+
+    def _write_sse(self, payload: dict | str) -> None:
+        if isinstance(payload, str):
+            data = payload.encode("utf-8")
         else:
-            self._send_json(200, build_completion(model, outcome["text"], outcome["usage"]))
+            data = json.dumps(payload).encode("utf-8")
+        self.wfile.write(b"data: " + data + b"\n\n")
+        self.wfile.flush()
 
     def _stream_response(self, model: str, outcome: dict, include_usage: bool) -> None:
+        """Legacy buffered stream response: one content chunk after completion."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -626,12 +1075,56 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             for chunk in build_stream_chunks(model, outcome["text"], outcome["usage"], include_usage):
-                self.wfile.write(b"data: " + json.dumps(chunk).encode("utf-8") + b"\n\n")
-                self.wfile.flush()
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+                self._write_sse(chunk)
+            self._write_sse("[DONE]")
         except (BrokenPipeError, ConnectionResetError):
             pass  # client hung up mid-stream
+
+    def _stream_live_response(self, model: str, prompt: str, engine: bool,
+                              overrides: dict, include_usage: bool) -> dict:
+        """SSE bridge for real `stream-json` deltas (#3)."""
+        cid, created = _completion_id(), int(time.time())
+
+        def chunk(delta, finish=None, usage_obj=None):
+            payload = {
+                "id": cid,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }
+            if usage_obj is not None:
+                payload["usage"] = usage_obj
+            return payload
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        outcome = {"text": "", "usage": _zero_usage(), "error": "stream ended before final event"}
+        try:
+            self._write_sse(chunk({"role": "assistant"}))
+            for kind, payload in stream_claude(prompt, model, engine, overrides):
+                if kind == "delta":
+                    self._write_sse(chunk({"content": payload}))
+                elif kind == "final" and isinstance(payload, dict):
+                    outcome = payload
+                    break
+            self._write_sse(chunk({}, finish="stop"))
+            if include_usage:
+                self._write_sse({
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [],
+                    "usage": outcome["usage"],
+                })
+            self._write_sse("[DONE]")
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client hung up mid-stream
+        return outcome
 
 
 def main() -> int:

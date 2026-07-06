@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Code CLI OpenAI-compatible shim for Hermes
+Documentation=https://github.com/Ouroborosrex/hermes-claude-code-cli-provider
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__PLUGIN_DIR__
+EnvironmentFile=-__HERMES_HOME__/claude-code-cli-shim.env
+ExecStart=__PLUGIN_DIR__/start.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

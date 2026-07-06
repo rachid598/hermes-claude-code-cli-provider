@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hermes.claude-code-cli-shim</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PLUGIN_DIR__/start.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__PLUGIN_DIR__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HERMES_HOME</key>
+    <string>__HERMES_HOME__</string>
+    <key>CLAUDE_CODE_CLI_HOST</key>
+    <string>__HOST__</string>
+    <key>CLAUDE_CODE_CLI_PORT</key>
+    <string>__PORT__</string>
+    <key>CLAUDE_CODE_CLI_BASE_URL</key>
+    <string>http://__HOST__:__PORT__/v1</string>
+    <key>CLAUDE_CODE_CLI_AUTOSTART</key>
+    <string>0</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/claude-code-cli-shim.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/claude-code-cli-shim.err.log</string>
+</dict>
+</plist>

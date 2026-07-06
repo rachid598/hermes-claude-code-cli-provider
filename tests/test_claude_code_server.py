@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import os
 import pathlib
+import re
 import stat
+import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from urllib import error, request
@@ -387,6 +391,282 @@ print(json.dumps({"result": "argv=" + " ".join(sys.argv[1:]), "usage": {"output_
                 )
         self.assertIn("--effort minimal", outcome["text"])
         self.assertNotIn("--effort high", outcome["text"])
+
+
+class VisionPassthroughTests(unittest.TestCase):
+    """Issue #4: image parts should reach the CLI as bounded temp-file/URL refs."""
+
+    def _data_url(self, payload: bytes = b"fakepng") -> str:
+        return "data:image/png;base64," + base64.b64encode(payload).decode("ascii")
+
+    def test_default_flatten_messages_still_omits_images_without_collector(self):
+        prompt = server.flatten_messages([{"role": "user", "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": self._data_url()}},
+        ]}])
+        self.assertIn("[image omitted]", prompt)
+        self.assertNotIn("image saved to", prompt)
+
+    def test_image_collector_materializes_base64_and_cleanup_removes_file(self):
+        payload = b"PNGDATA"
+        with temporary_env(CLAUDE_CODE_CLI_VISION="1", CLAUDE_CODE_CLI_MAX_IMAGES="8",
+                           CLAUDE_CODE_CLI_MAX_IMAGE_MB="10"):
+            images = server._ImageCollector()
+            prompt = server.flatten_messages([{"role": "user", "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": self._data_url(payload)}},
+            ]}], images)
+
+        self.assertEqual(len(images.paths), 1)
+        img = pathlib.Path(images.paths[0])
+        self.assertTrue(img.exists())
+        self.assertEqual(img.read_bytes(), payload)
+        self.assertIn(str(img), prompt)
+        self.assertIn("read this file to view the image", prompt)
+        parent = img.parent
+        images.cleanup()
+        self.assertFalse(img.exists())
+        self.assertFalse(parent.exists())
+
+    def test_image_collector_passes_remote_url_without_downloading(self):
+        images = server._ImageCollector()
+        prompt = server.flatten_messages([{"role": "user", "content": [
+            {"type": "image_url", "image_url": "https://example.invalid/cat.png"},
+        ]}], images)
+        try:
+            self.assertIn("[image at https://example.invalid/cat.png", prompt)
+            self.assertEqual(images.paths, [])
+            self.assertEqual(images.count, 1)
+        finally:
+            images.cleanup()
+
+    def test_image_limits_and_disabled_mode_degrade_gracefully(self):
+        with temporary_env(CLAUDE_CODE_CLI_MAX_IMAGES="1", CLAUDE_CODE_CLI_VISION="1"):
+            images = server._ImageCollector()
+            first = images.add(self._data_url(b"one"))
+            second = images.add(self._data_url(b"two"))
+        try:
+            self.assertIn("image saved to", first)
+            self.assertIn("over the 1-image limit", second)
+            self.assertEqual(len(images.paths), 1)
+        finally:
+            images.cleanup()
+
+        with temporary_env(CLAUDE_CODE_CLI_VISION="0"):
+            disabled = server._ImageCollector()
+            self.assertEqual(disabled.add(self._data_url()), "[image omitted]")
+            self.assertEqual(disabled.paths, [])
+
+    def test_oversized_image_is_omitted_without_temp_file(self):
+        with temporary_env(CLAUDE_CODE_CLI_MAX_IMAGE_MB="0.000001"):
+            images = server._ImageCollector()
+            text = images.add(self._data_url(b"more-than-one-byte"))
+        try:
+            self.assertIn("exceeds", text)
+            self.assertEqual(images.paths, [])
+        finally:
+            images.cleanup()
+
+    def test_http_request_image_file_is_visible_to_fake_cli_then_cleaned(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, os, re, sys
+prompt = sys.stdin.read()
+m = re.search(r"image saved to (\\S+)", prompt)
+path = m.group(1) if m else ""
+exists = bool(path and os.path.exists(path))
+size = os.path.getsize(path) if exists else -1
+print(json.dumps({"result": f"image_exists={exists} image_size={size} image_path={path}", "usage": {"input_tokens": 1, "output_tokens": 1}}))
+""")
+            payload = b"visible"
+            with temporary_env(CLAUDE_CODE_CLI_BIN=str(fake), CLAUDE_CODE_CLI_TIMEOUT="5",
+                               CLAUDE_CODE_CLI_VISION="1"):
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    req = request.Request(
+                        f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "haiku",
+                            "messages": [{"role": "user", "content": [
+                                {"type": "text", "text": "describe"},
+                                {"type": "image_url", "image_url": {"url": self._data_url(payload)}},
+                            ]}],
+                        }).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    completion = json.loads(request.urlopen(req, timeout=5).read().decode("utf-8"))
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=5)
+
+        text = completion["choices"][0]["message"]["content"]
+        self.assertIn("image_exists=True", text)
+        self.assertIn("image_size=7", text)
+        match = re.search(r"image_path=(\S+)", text)
+        self.assertIsNotNone(match)
+        assert match is not None
+        path = match.group(1)
+        self.assertFalse(pathlib.Path(path).exists())
+        self.assertFalse(pathlib.Path(path).parent.exists())
+
+
+class RealStreamingTests(unittest.TestCase):
+    """Issue #3: stream:true should bridge Claude stream-json events incrementally."""
+
+    def test_stream_argv_uses_stream_json_verbose_and_partial_messages(self):
+        with temporary_env(CLAUDE_CODE_CLI_BIN="/tmp/fake-claude"):
+            argv = server.build_claude_argv("sonnet", engine=False, stream=True)
+        self.assertEqual(argv[:6], ["/tmp/fake-claude", "-p", "--model", "sonnet", "--output-format", "stream-json"])
+        self.assertIn("--verbose", argv)
+        self.assertIn("--include-partial-messages", argv)
+
+    def test_iter_stream_json_ignores_invalid_lines(self):
+        events = list(server.iter_stream_json([
+            "not-json\n",
+            "{\"type\": \"stream_event\"}\n",
+            "[]\n",
+            "  {\"type\": \"result\", \"result\": \"ok\"}  \n",
+        ]))
+        self.assertEqual([ev.get("type") for ev in events], ["stream_event", "result"])
+
+    def test_extract_stream_delta_handles_wrapped_and_direct_shapes(self):
+        wrapped = {"type": "stream_event", "event": {
+            "type": "content_block_delta", "delta": {"type": "text_delta", "text": "hel"},
+        }}
+        direct = {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "lo"}}
+        tool_args = {"type": "stream_event", "event": {
+            "type": "content_block_delta", "delta": {"type": "input_json_delta", "partial_json": "{}"},
+        }}
+        self.assertEqual(server._extract_stream_delta(wrapped), "hel")
+        self.assertEqual(server._extract_stream_delta(direct), "lo")
+        self.assertEqual(server._extract_stream_delta(tool_args), "")
+
+    def test_stream_claude_yields_delta_before_final_result(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys, time
+sys.stdin.read()
+fmt = sys.argv[sys.argv.index("--output-format") + 1] if "--output-format" in sys.argv else ""
+if fmt != "stream-json":
+    print("expected stream-json", file=sys.stderr)
+    sys.exit(9)
+def emit(obj):
+    print(json.dumps(obj), flush=True)
+emit({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hel"}}})
+time.sleep(0.2)
+emit({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "lo"}})
+emit({"type": "result", "result": "hello", "usage": {"input_tokens": 4, "output_tokens": 5}})
+""")
+            with temporary_env(CLAUDE_CODE_CLI_BIN=str(fake), CLAUDE_CODE_CLI_TIMEOUT="5"):
+                gen = server.stream_claude("prompt", "haiku", engine=False)
+                started = time.monotonic()
+                first = next(gen)
+                first_elapsed = time.monotonic() - started
+                rest = list(gen)
+
+        self.assertLess(first_elapsed, 1.0)
+        self.assertEqual(first, ("delta", "hel"))
+        self.assertIn(("delta", "lo"), rest)
+        finals = [payload for kind, payload in rest if kind == "final" and isinstance(payload, dict)]
+        self.assertEqual(len(finals), 1)
+        final = finals[0]
+        self.assertEqual(final["text"], "hello")
+        self.assertEqual(final["usage"], {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9})
+
+    def test_stream_claude_bare_json_result_falls_back_to_single_delta(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({"result": "buffered fallback", "usage": {"input_tokens": 2, "output_tokens": 3}}), flush=True)
+""")
+            with temporary_env(CLAUDE_CODE_CLI_BIN=str(fake), CLAUDE_CODE_CLI_TIMEOUT="5"):
+                events = list(server.stream_claude("prompt", "haiku", engine=False))
+        self.assertEqual(events[0], ("delta", "buffered fallback"))
+        self.assertEqual(events[-1][0], "final")
+        final = events[-1][1]
+        self.assertIsInstance(final, dict)
+        assert isinstance(final, dict)
+        self.assertEqual(final["usage"]["total_tokens"], 5)
+
+    def test_http_stream_response_forwards_incremental_jsonl_and_usage(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+def emit(obj):
+    print(json.dumps(obj), flush=True)
+emit({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "one"}}})
+emit({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "two"}}})
+emit({"type": "result", "result": "onetwo", "usage": {"input_tokens": 1, "output_tokens": 2}})
+""")
+            with temporary_env(CLAUDE_CODE_CLI_BIN=str(fake), CLAUDE_CODE_CLI_TIMEOUT="5",
+                               CLAUDE_CODE_CLI_STREAM="1"):
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    req = request.Request(
+                        f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                        data=json.dumps({
+                            "model": "haiku",
+                            "stream": True,
+                            "stream_options": {"include_usage": True},
+                            "messages": [{"role": "user", "content": "say hi"}],
+                        }).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with request.urlopen(req, timeout=5) as resp:
+                        lines: list[str] = []
+                        while True:
+                            line = resp.readline().decode("utf-8")
+                            if not line:
+                                break
+                            lines.append(line)
+                            if line.strip() == "data: [DONE]":
+                                break
+                    body = "".join(lines)
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=5)
+        self.assertIn('"content": "one"', body)
+        self.assertIn('"content": "two"', body)
+        self.assertIn('"usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}', body)
+        self.assertIn("data: [DONE]", body)
+
+
+class ManagedServiceTests(unittest.TestCase):
+    """Issue #2: opt-in service templates and helpers are shipped but not run."""
+
+    def test_service_templates_and_scripts_are_present_and_safe_to_parse(self):
+        root = pathlib.Path(__file__).resolve().parents[1]
+        install = root / "scripts" / "install-service.sh"
+        uninstall = root / "scripts" / "uninstall-service.sh"
+        systemd = root / "service" / "systemd" / "claude-code-cli-shim.service"
+        launchd = root / "service" / "launchd" / "com.hermes.claude-code-cli-shim.plist"
+
+        for script in (install, uninstall):
+            self.assertTrue(script.exists(), script)
+            self.assertTrue(os.access(script, os.X_OK), script)
+            subprocess.run(["bash", "-n", str(script)], check=True)
+
+        unit = systemd.read_text(encoding="utf-8")
+        self.assertIn("Restart=on-failure", unit)
+        self.assertIn("WantedBy=default.target", unit)
+        self.assertIn("EnvironmentFile=-__HERMES_HOME__/claude-code-cli-shim.env", unit)
+        self.assertIn("ExecStart=__PLUGIN_DIR__/start.sh", unit)
+
+        plist = launchd.read_text(encoding="utf-8")
+        self.assertIn("<key>KeepAlive</key>", plist)
+        self.assertIn("__PLUGIN_DIR__/start.sh", plist)
+        self.assertIn("__HOST__", plist)
+        self.assertIn("__PORT__", plist)
 
 
 if __name__ == "__main__":

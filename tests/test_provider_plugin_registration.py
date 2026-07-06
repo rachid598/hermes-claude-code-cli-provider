@@ -41,6 +41,7 @@ class ProviderPluginRegistrationTests(unittest.TestCase):
                 self.assertEqual(profile.api_mode, "chat_completions")
                 self.assertEqual(profile.base_url, "http://127.0.0.1:8765/v1")
                 self.assertEqual(profile.auth_type, "api_key")
+                self.assertTrue(profile.supports_vision)
                 self.assertEqual(profile.env_vars, ("CLAUDE_CODE_CLI_API_KEY", "CLAUDE_CODE_CLI_BASE_URL"))
                 self.assertEqual(profile.fallback_models, ("opus", "sonnet", "haiku"))
                 self.assertEqual(profile.default_aux_model, "haiku")

@@ -51,7 +51,7 @@ claude_code_cli = ProviderProfile(
     env_vars=("CLAUDE_CODE_CLI_API_KEY", "CLAUDE_CODE_CLI_BASE_URL"),
     base_url=_DEFAULT_SHIM_BASE_URL,
     auth_type="api_key",
-    supports_vision=False,
+    supports_vision=True,
     # Model ids the shim accepts and forwards verbatim to `claude --model`.
     # Shown in pickers when the live /models probe is unavailable.
     fallback_models=("opus", "sonnet", "haiku"),

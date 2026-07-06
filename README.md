@@ -19,7 +19,8 @@ claude-code-cli/
 ├── claude_code_server.py  OpenAI-compatible shim that shells out to `claude -p`
 ├── autostart.py           best-effort profile-aware shim autostart
 ├── start.sh               launcher for the shim
-├── scripts/               install, test, and fake-smoke helpers
+├── service/               optional systemd/launchd service templates
+├── scripts/               install, service, test, and fake-smoke helpers
 ├── tests/                 fake-Claude and provider-registration tests
 └── README.md              this file
 ```
@@ -161,6 +162,39 @@ local shim; it is not sent to Anthropic.
 > therefore honored even when Hermes has not loaded the profile `.env` into
 > `os.environ` yet.
 
+### Optional managed service
+
+For a reboot/logout-surviving shim, install the opt-in user service instead of
+relying on provider-import autostart:
+
+```bash
+cd "${HERMES_HOME:-$HOME/.hermes}/plugins/model-providers/claude-code-cli"
+scripts/install-service.sh
+```
+
+- Linux installs and starts a `systemd --user` unit named
+  `claude-code-cli-shim.service`.
+- macOS installs and starts a LaunchAgent named
+  `com.hermes.claude-code-cli-shim`.
+- The installer writes `${HERMES_HOME:-$HOME/.hermes}/claude-code-cli-shim.env`
+  with the host/port/base-url settings and sets `CLAUDE_CODE_CLI_AUTOSTART=0`
+  for the service-managed shim.
+
+Useful checks:
+
+```bash
+systemctl --user status claude-code-cli-shim          # Linux
+journalctl --user -u claude-code-cli-shim -n 50      # Linux logs
+launchctl print gui/$(id -u)/com.hermes.claude-code-cli-shim  # macOS
+tail -n 50 "${HERMES_HOME:-$HOME/.hermes}/logs/claude-code-cli-shim.err.log" # macOS logs
+```
+
+Uninstall the service without removing the plugin:
+
+```bash
+scripts/uninstall-service.sh
+```
+
 ## Configuration
 
 The shim reads these environment variables (all optional):
@@ -182,6 +216,10 @@ The shim reads these environment variables (all optional):
 | `CLAUDE_CODE_CLI_CWD` | `$HOME` | Working directory Claude Code operates in (engine mode). |
 | `CLAUDE_CODE_CLI_ADD_DIR` | _unset_ | Extra dirs (`--add-dir`), `os.pathsep`-separated. |
 | `CLAUDE_CODE_CLI_TIMEOUT` | `600` | Per-request timeout (seconds). |
+| `CLAUDE_CODE_CLI_STREAM` | `1` | For `stream: true`, use live Claude Code `stream-json` events (`0` = legacy buffered chunk). |
+| `CLAUDE_CODE_CLI_VISION` | `1` | Materialize image inputs into Claude-readable temp files / URL refs (`0` = `[image omitted]`). |
+| `CLAUDE_CODE_CLI_MAX_IMAGES` | `8` | Maximum image parts accepted per request. |
+| `CLAUDE_CODE_CLI_MAX_IMAGE_MB` | `20` | Maximum decoded size for each data-URL/base64 image. |
 | `CLAUDE_CODE_CLI_EXTRA_ARGS` | _unset_ | Extra argv appended to every call (shlex-split). |
 | `CLAUDE_CODE_CLI_AUTOSTART` | `1` | Auto-start the shim on first use when this provider is configured (`0`/`false` to disable). |
 
@@ -191,6 +229,31 @@ The provider profile also honors two Hermes-side env vars:
   `http://127.0.0.1:8765/v1`). Set this if you change the shim's host/port.
 - `CLAUDE_CODE_CLI_API_KEY` — the placeholder key Hermes stores (ignored by the
   shim).
+
+### Streaming behavior
+
+When a request sets `stream: true`, the shim now invokes Claude Code with
+`--output-format stream-json --verbose --include-partial-messages` and forwards
+text deltas as OpenAI-compatible Server-Sent Events. The final Claude `result`
+event is mapped back to usage metadata when available.
+
+If the CLI only returns a single buffered JSON object (or you set
+`CLAUDE_CODE_CLI_STREAM=0`), the shim falls back to the legacy behavior: one
+content chunk followed by `[DONE]`. This keeps older fake-CLI/test setups and
+unexpected Claude Code output shapes from breaking clients.
+
+### Vision/image inputs
+
+OpenAI image content parts are no longer silently dropped by default. For data
+URLs/base64 payloads, the shim writes bounded per-request temp files and tells
+Claude Code to read those paths; remote `http(s)` image URLs are passed through
+as URL references. Temp files are removed after the request finishes.
+
+Safety knobs:
+
+- `CLAUDE_CODE_CLI_MAX_IMAGES` limits the number of image parts per request.
+- `CLAUDE_CODE_CLI_MAX_IMAGE_MB` limits each decoded base64/data-URL payload.
+- `CLAUDE_CODE_CLI_VISION=0` restores the old `[image omitted]` behavior.
 
 ### Per-request overrides
 
@@ -269,11 +332,20 @@ intend to exercise a logged-in Claude Code installation.
 
 ## Uninstall
 
+If you installed the optional managed service, remove it first:
+
+```bash
+cd "${HERMES_HOME:-$HOME/.hermes}/plugins/model-providers/claude-code-cli"
+scripts/uninstall-service.sh
+```
+
+Then remove the plugin:
+
 ```bash
 rm -rf "${HERMES_HOME:-$HOME/.hermes}/plugins/model-providers/claude-code-cli"
 ```
 
-Then re-point your default model away from `claude-code-cli` via `hermes model`.
+Finally, re-point your default model away from `claude-code-cli` via `hermes model`.
 
 ## License
 
