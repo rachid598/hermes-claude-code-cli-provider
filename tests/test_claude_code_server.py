@@ -236,6 +236,207 @@ print(json.dumps({"result": "hello from fake http", "usage": {"input_tokens": 1,
             thread.join(timeout=5)
 
 
+class NativeToolCallTests(unittest.TestCase):
+    """Hermes-native tool-call emulation: the shim emits OpenAI tool_calls."""
+
+    def _tool_request(self, base: str, *, stream: bool = False, tool_choice="auto") -> request.Request:
+        body = {
+            "model": "haiku",
+            "stream": stream,
+            "messages": [{"role": "user", "content": "List my available skills."}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "skill_view",
+                    "description": "Load a Hermes skill by name.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"],
+                    },
+                },
+            }],
+            "tool_choice": tool_choice,
+        }
+        return request.Request(
+            base + "/v1/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+    def test_native_tool_call_response_shape_from_fake_cli_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys
+prompt = sys.stdin.read()
+assert "Available Hermes-native tools" in prompt
+assert "skill_view" in prompt
+print(json.dumps({
+    "result": json.dumps({"tool_calls": [{"name": "skill_view", "arguments": {"name": "hermes-agent"}}]}),
+    "usage": {"input_tokens": 4, "output_tokens": 5},
+}))
+""")
+            with temporary_env(CLAUDE_CODE_CLI_BIN=str(fake), CLAUDE_CODE_CLI_TIMEOUT="5"):
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                    completion = json.loads(request.urlopen(self._tool_request(base), timeout=5).read().decode("utf-8"))
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=5)
+
+        choice = completion["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        message = choice["message"]
+        self.assertEqual(message["role"], "assistant")
+        self.assertEqual(message["content"], "")
+        calls = message["tool_calls"]
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["id"].startswith("call_"))
+        self.assertEqual(calls[0]["type"], "function")
+        self.assertEqual(calls[0]["function"]["name"], "skill_view")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"name": "hermes-agent"})
+        self.assertEqual(completion["usage"]["total_tokens"], 9)
+
+    def test_native_tool_call_fallbacks_to_text_on_non_json_result(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({"result": "I can answer without a tool.", "usage": {"input_tokens": 1, "output_tokens": 2}}))
+""")
+            with temporary_env(CLAUDE_CODE_CLI_BIN=str(fake), CLAUDE_CODE_CLI_TIMEOUT="5"):
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                    completion = json.loads(request.urlopen(self._tool_request(base), timeout=5).read().decode("utf-8"))
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=5)
+
+        choice = completion["choices"][0]
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertEqual(choice["message"]["content"], "I can answer without a tool.")
+        self.assertNotIn("tool_calls", choice["message"])
+
+    def test_native_tool_call_stream_request_is_buffered_tool_call_response(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({
+    "result": json.dumps({"tool_calls": [{"name": "skill_view", "arguments": {"name": "debugging-workflows"}}]}),
+    "usage": {"input_tokens": 3, "output_tokens": 4},
+}))
+""")
+            with temporary_env(CLAUDE_CODE_CLI_BIN=str(fake), CLAUDE_CODE_CLI_TIMEOUT="5"):
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                    with request.urlopen(self._tool_request(base, stream=True), timeout=5) as resp:
+                        lines: list[str] = []
+                        while True:
+                            line = resp.readline().decode("utf-8")
+                            if not line:
+                                break
+                            lines.append(line)
+                            if line.strip() == "data: [DONE]":
+                                break
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=5)
+
+        events = []
+        for line in lines:
+            if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                continue
+            events.append(json.loads(line[len("data: "):]))
+        tool_chunks = [
+            ev["choices"][0]["delta"]["tool_calls"][0]
+            for ev in events
+            if ev.get("choices") and ev["choices"][0].get("delta", {}).get("tool_calls")
+        ]
+        self.assertEqual(len(tool_chunks), 1)
+        self.assertEqual(tool_chunks[0]["function"]["name"], "skill_view")
+        self.assertEqual(json.loads(tool_chunks[0]["function"]["arguments"]), {"name": "debugging-workflows"})
+        self.assertTrue(any(ev.get("choices") and ev["choices"][0].get("finish_reason") == "tool_calls" for ev in events))
+        self.assertEqual(lines[-1].strip(), "data: [DONE]")
+
+    def test_extract_native_tool_calls_filters_unknown_names_and_allows_multiple(self):
+        tools = [
+            {"type": "function", "function": {"name": "skill_view"}},
+            {"type": "function", "function": {"name": "todo"}},
+        ]
+        calls = server.extract_native_tool_calls(json.dumps({"tool_calls": [
+            {"name": "skill_view", "arguments": {"name": "hermes-agent"}},
+            {"name": "unknown", "arguments": {"x": 1}},
+            {"function": {"name": "todo", "arguments": "{\"merge\":true}"}},
+        ]}), tools)
+        self.assertEqual([c["function"]["name"] for c in calls], ["skill_view", "todo"])
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"name": "hermes-agent"})
+        self.assertEqual(json.loads(calls[1]["function"]["arguments"]), {"merge": True})
+
+    def test_tool_choice_none_uses_plain_text_even_when_tools_are_present(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys
+prompt = sys.stdin.read()
+print(json.dumps({"result": "has_native_prompt=" + str("Available Hermes-native tools" in prompt)}))
+""")
+            with temporary_env(CLAUDE_CODE_CLI_BIN=str(fake), CLAUDE_CODE_CLI_TIMEOUT="5"):
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                    completion = json.loads(request.urlopen(self._tool_request(base, tool_choice="none"), timeout=5).read().decode("utf-8"))
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=5)
+        self.assertEqual(completion["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(completion["choices"][0]["message"]["content"], "has_native_prompt=False")
+
+    def test_engine_always_preserves_legacy_claude_code_engine_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys
+prompt = sys.stdin.read()
+print(json.dumps({
+    "result": "argv=" + " ".join(sys.argv[1:]) + "\\nprompt=" + prompt[-120:],
+    "usage": {"output_tokens": 1},
+}))
+""")
+            with temporary_env(CLAUDE_CODE_CLI_BIN=str(fake), CLAUDE_CODE_CLI_TIMEOUT="5",
+                               CLAUDE_CODE_CLI_ENGINE="always"):
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                    completion = json.loads(request.urlopen(self._tool_request(base), timeout=5).read().decode("utf-8"))
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=5)
+
+        text = completion["choices"][0]["message"]["content"]
+        self.assertEqual(completion["choices"][0]["finish_reason"], "stop")
+        self.assertIn("--allowedTools", text)
+        self.assertIn("carry out the task", text)
+        self.assertNotIn("tool_calls", completion["choices"][0]["message"])
+
+
 class PerRequestOverrideTests(unittest.TestCase):
     """Issue #5: a single request can override effort / max-turns / tool lists,
     while an omitted field falls back to the env default."""

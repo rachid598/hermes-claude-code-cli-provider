@@ -12,7 +12,7 @@
 
 A local [Hermes](https://github.com/NousResearch/hermes-agent) model-provider plugin that exposes the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) through an OpenAI-compatible Chat Completions shim. Hermes talks to `http://127.0.0.1:8765/v1`, and the shim runs `claude -p` using the local Claude Code login. No Anthropic API key is stored in Hermes.
 
-Use it for local Claude Code powered chat, advisory work, streaming, vision inputs, and one-shot engine-mode tasks. Hermes-native tool event streaming and interactive permission bridging require deeper Hermes core integration and are tracked separately.
+Use it for local Claude Code powered chat, advisory work, streaming, vision inputs, Hermes-native tool calls, and explicit one-shot engine-mode tasks.
 
 ## Features
 
@@ -21,7 +21,8 @@ Use it for local Claude Code powered chat, advisory work, streaming, vision inpu
 - Optional autostart plus managed `systemd --user` and macOS LaunchAgent support.
 - Live Claude Code `stream-json` to OpenAI Server-Sent Events translation.
 - Bounded image passthrough for OpenAI `image_url` content parts.
-- Engine mode for autonomous one-shot Claude Code tool use.
+- Hermes-native OpenAI `tool_calls` emulation for normal Hermes tool loops.
+- Explicit engine mode for autonomous one-shot Claude Code tool use.
 - Fake-Claude test harness that does not require Claude Code authentication.
 
 ## Requirements
@@ -98,6 +99,12 @@ Quick smoke check:
 hermes chat -Q --provider claude-code-cli -m haiku -q "Say hello from Claude Code."
 ```
 
+Provider-native tool-loop smoke without real Claude Code authentication:
+
+```bash
+scripts/smoke_native_tool_loop.py
+```
+
 ## Configuration
 
 Most users only need the defaults. See `.env.example` for the full list.
@@ -111,7 +118,8 @@ Most users only need the defaults. See `.env.example` for the full list.
 | `CLAUDE_CODE_CLI_BIN` | autodetect | Path to the `claude` binary. |
 | `CLAUDE_CODE_CLI_MODEL` | `sonnet` | Fallback model. |
 | `CLAUDE_CODE_CLI_AUTOSTART` | `1` | Start the shim during provider load when needed. |
-| `CLAUDE_CODE_CLI_ENGINE` | `auto` | `auto`, `always`, or `never`. |
+| `CLAUDE_CODE_CLI_ENGINE` | `auto` | `auto`, `always`, or `never`; `always` opts into Claude Code's own tool loop. |
+| `CLAUDE_CODE_CLI_NATIVE_TOOLS` | `1` | Emit OpenAI `tool_calls` so Hermes executes its native tools. |
 | `CLAUDE_CODE_CLI_CWD` | `$HOME` | Working directory for Claude Code engine-mode runs. |
 | `CLAUDE_CODE_CLI_ENGINE_TOOLS` | common file and web tools | Tool allowlist for engine mode. |
 | `CLAUDE_CODE_CLI_STREAM` | `1` | Use live `stream-json` for streaming requests. |
@@ -120,11 +128,17 @@ Most users only need the defaults. See `.env.example` for the full list.
 
 ## Behavior notes
 
+### Hermes-native tool calls
+
+When Hermes sends OpenAI `tools`, the default path keeps Hermes in charge: Claude Code is asked whether it needs a tool, the shim converts its strict JSON request into OpenAI `tool_calls`, and Hermes executes the tool and sends the result back. This is the path used for normal Hermes features such as skill browsing and other tool-driven flows.
+
+For `stream: true` requests that result in a tool call, the shim emits OpenAI-compatible tool-call Server-Sent Events after buffering Claude Code's JSON decision. Plain text streaming is unchanged.
+
 ### Engine mode
 
-`claude -p` is a complete agent with its own tool loop. In `auto` mode, the shim enables engine mode when the Hermes request includes tool definitions. Claude Code then performs the work with its local tools and returns final assistant text.
+`claude -p` is also a complete agent with its own tool loop. Set `CLAUDE_CODE_CLI_ENGINE=always` only when you want Claude Code itself to read files, edit files, or run commands in `CLAUDE_CODE_CLI_CWD` and return final assistant text.
 
-Engine mode can read files, edit files, and run commands in `CLAUDE_CODE_CLI_CWD`. Set that directory deliberately, restrict tools with `CLAUDE_CODE_CLI_ENGINE_TOOLS`, or use `CLAUDE_CODE_CLI_ENGINE=never` for text-only behavior.
+Engine mode can read files, edit files, and run commands in `CLAUDE_CODE_CLI_CWD`. Set that directory deliberately and restrict tools with `CLAUDE_CODE_CLI_ENGINE_TOOLS`.
 
 ### Streaming
 

@@ -17,12 +17,13 @@ Endpoints
 * ``GET  /v1/models``             advertises the model ids the CLI accepts
 * ``POST /v1/chat/completions``   chat completion (supports ``stream: true``)
 
-Caveat
-------
-`claude -p` is a *complete agent*: it runs its own internal tool loop and
-returns final text. This shim therefore returns plain assistant text, never
-OpenAI-style ``tool_calls``. It is best for chat / advisory / synthesis use.
-For Hermes' native tool-calling loop, use the bundled ``anthropic`` provider.
+Tool behavior
+-------------
+When Hermes sends OpenAI ``tools``, the shim defaults to Hermes-native
+tool-call emulation: Claude Code is invoked in text mode, returns a strict JSON
+request, and the shim reshapes it into OpenAI-style ``tool_calls`` for Hermes
+to execute. Set ``CLAUDE_CODE_CLI_ENGINE=always`` when you deliberately want
+Claude Code's own tool loop instead.
 
 Configuration (environment variables)
 -------------------------------------
@@ -37,6 +38,7 @@ Configuration (environment variables)
     CLAUDE_CODE_CLI_TIMEOUT        per-request seconds  (default 600)
     CLAUDE_CODE_CLI_EXTRA_ARGS     extra argv, shlex    (default unset)
     CLAUDE_CODE_CLI_STREAM         real token streaming (default 1; see #3)
+    CLAUDE_CODE_CLI_NATIVE_TOOLS   emit OpenAI tool_calls (default on)
     CLAUDE_CODE_CLI_VISION         pass images to claude(default on;  see #4)
     CLAUDE_CODE_CLI_MAX_IMAGES     images per request   (default 8)
     CLAUDE_CODE_CLI_MAX_IMAGE_MB   per-image size cap MB (default 20)
@@ -338,6 +340,151 @@ def flatten_messages(messages: list[dict], images: _ImageCollector | None = None
         "Return only the response text."
     )
     return "\n\n".join(parts).strip()
+
+
+def _native_tools_enabled() -> bool:
+    """Whether the shim may emulate OpenAI tool_calls for Hermes-native tools."""
+    return _env("CLAUDE_CODE_CLI_NATIVE_TOOLS", "1").strip().lower() not in {
+        "0", "false", "no", "off", "disabled",
+    }
+
+
+def _tool_choice_is_none(tool_choice) -> bool:
+    return isinstance(tool_choice, str) and tool_choice.strip().lower() == "none"
+
+
+def _tool_choice_name(tool_choice) -> str:
+    if not isinstance(tool_choice, dict):
+        return ""
+    fn = tool_choice.get("function")
+    if isinstance(fn, dict):
+        name = fn.get("name")
+        return name.strip() if isinstance(name, str) else ""
+    return ""
+
+
+def _openai_tool_defs(tools) -> list[dict]:
+    """Return sanitized OpenAI function-tool definitions from a request body."""
+    if not isinstance(tools, list):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in tools:
+        if not isinstance(item, dict):
+            continue
+        fn = item.get("function") if isinstance(item.get("function"), dict) else item
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        name = name.strip()
+        if name in seen:
+            continue
+        seen.add(name)
+        rec = {"type": "function", "function": {"name": name}}
+        for key in ("description", "parameters"):
+            if key in fn:
+                rec["function"][key] = fn[key]
+        out.append(rec)
+    return out
+
+
+def build_native_tool_prompt(prompt: str, tools: list[dict], tool_choice=None) -> str:
+    """Append instructions that let Claude request Hermes-native tool calls.
+
+    Claude Code is still invoked in text mode. If it needs a Hermes tool, it
+    returns a strict JSON envelope; the shim reshapes that envelope into the
+    OpenAI ``message.tool_calls`` form that Hermes already knows how to execute.
+    """
+    tool_json = json.dumps(tools, ensure_ascii=False, indent=2)
+    required = isinstance(tool_choice, str) and tool_choice.strip().lower() == "required"
+    specific = _tool_choice_name(tool_choice)
+    if specific:
+        choice_line = f"You must call the Hermes-native tool named {specific!r}."
+    elif required:
+        choice_line = "You must call at least one Hermes-native tool."
+    else:
+        choice_line = "Call a Hermes-native tool only when it is needed; otherwise answer normally as text."
+    return (
+        prompt.rstrip()
+        + "\n\nHermes-native tool calling is available. "
+        + "Do not run these tools yourself and do not simulate their results. "
+        + "When you request a tool, Hermes will execute it and send the result back in a later turn.\n\n"
+        + "Available Hermes-native tools:\n"
+        + tool_json
+        + "\n\n"
+        + choice_line
+        + "\nIf you need one or more tools, respond with ONLY strict JSON in this exact shape:\n"
+        + '{"tool_calls":[{"name":"tool_name","arguments":{"key":"value"}}]}'
+        + "\nUse only tool names from the list above. Arguments must be a JSON object. "
+        + "Do not include prose, Markdown fences, or extra keys around the JSON. "
+        + "After Hermes sends tool results, use them to answer normally unless another tool call is needed."
+    )
+
+
+def _tool_arguments_json(arguments) -> str:
+    if arguments is None:
+        return "{}"
+    if isinstance(arguments, str):
+        raw = arguments.strip()
+        if not raw:
+            return "{}"
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = {"input": arguments}
+    elif isinstance(arguments, dict):
+        parsed = arguments
+    else:
+        parsed = {"value": arguments}
+    try:
+        return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return json.dumps({"value": str(arguments)}, ensure_ascii=False, separators=(",", ":"))
+
+
+def extract_native_tool_calls(text: str, tools: list[dict]) -> list[dict]:
+    """Extract OpenAI-shaped tool calls from Claude's strict JSON envelope."""
+    parsed = _extract_json_object(text)
+    if not isinstance(parsed, dict):
+        return []
+    raw_calls = parsed.get("tool_calls")
+    if raw_calls is None and "tool_call" in parsed:
+        raw_calls = [parsed.get("tool_call")]
+    if raw_calls is None and ("name" in parsed or "function" in parsed):
+        raw_calls = [parsed]
+    if not isinstance(raw_calls, list):
+        return []
+
+    allowed = {
+        tool.get("function", {}).get("name")
+        for tool in tools
+        if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+    }
+    out: list[dict] = []
+    for call in raw_calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name = call.get("name") or fn.get("name")
+        if not isinstance(name, str) or name not in allowed:
+            continue
+        arguments = call.get("arguments")
+        if arguments is None:
+            arguments = fn.get("arguments")
+        call_id = call.get("id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            call_id = "call_" + uuid.uuid4().hex
+        out.append({
+            "id": call_id.strip(),
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": _tool_arguments_json(arguments),
+            },
+        })
+    return out
 
 
 # Tools pre-approved in engine mode so `claude -p` can run them without an
@@ -927,6 +1074,21 @@ def build_completion(model: str, text: str, usage: dict) -> dict:
     }
 
 
+def build_tool_call_completion(model: str, tool_calls: list[dict], usage: dict) -> dict:
+    return {
+        "id": _completion_id(),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "", "tool_calls": tool_calls},
+            "finish_reason": "tool_calls",
+        }],
+        "usage": usage,
+    }
+
+
 def build_stream_chunks(model: str, text: str, usage: dict, include_usage: bool):
     cid, created = _completion_id(), int(time.time())
 
@@ -948,6 +1110,42 @@ def build_stream_chunks(model: str, text: str, usage: dict, include_usage: bool)
     yield chunk({}, finish="stop")
     if include_usage:
         # OpenAI emits a trailing usage-only chunk with an empty choices list.
+        yield {
+            "id": cid, "object": "chat.completion.chunk", "created": created,
+            "model": model, "choices": [], "usage": usage,
+        }
+
+
+def build_tool_call_stream_chunks(model: str, tool_calls: list[dict], usage: dict, include_usage: bool):
+    cid, created = _completion_id(), int(time.time())
+
+    def chunk(delta, finish=None, usage_obj=None):
+        payload = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+        if usage_obj is not None:
+            payload["usage"] = usage_obj
+        return payload
+
+    yield chunk({"role": "assistant"})
+    for idx, tc in enumerate(tool_calls):
+        yield chunk({
+            "tool_calls": [{
+                "index": idx,
+                "id": tc["id"],
+                "type": "function",
+                "function": {
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"]["arguments"],
+                },
+            }]
+        })
+    yield chunk({}, finish="tool_calls")
+    if include_usage:
         yield {
             "id": cid, "object": "chat.completion.chunk", "created": created,
             "model": model, "choices": [], "usage": usage,
@@ -1015,17 +1213,23 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream"))
         include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
 
-        # Engine mode: let Claude Code use its own tools to do real work.
-        # "auto" (default) turns it on when the request carries tool definitions
-        # (an agentic Hermes turn); aux completions (no tools) stay text-only.
+        tools = _openai_tool_defs(body.get("tools"))
+        tool_choice = body.get("tool_choice", "auto")
+
+        # Engine mode: let Claude Code use its own tools to do real work, but
+        # only when explicitly requested. In the default/auto setting, OpenAI
+        # request tools mean Hermes-native tool calls, matching normal providers.
         mode = _env("CLAUDE_CODE_CLI_ENGINE", "auto").strip().lower()
         if mode in {"always", "on", "1", "true", "yes"}:
             engine = True
-        elif mode in {"never", "off", "0", "false", "no"}:
-            engine = False
         else:
-            _tools = body.get("tools")
-            engine = isinstance(_tools, list) and len(_tools) > 0
+            engine = False
+        native_tools = (
+            bool(tools)
+            and not engine
+            and _native_tools_enabled()
+            and not _tool_choice_is_none(tool_choice)
+        )
 
         images = _ImageCollector()
         try:
@@ -1037,10 +1241,29 @@ class Handler(BaseHTTPRequestHandler):
                     "them to actually carry out the task - read/modify files, run commands - then "
                     "report what you did. Do not ask for permission; act."
                 )
+            elif native_tools:
+                prompt = build_native_tool_prompt(prompt, tools, tool_choice)
             overrides = extract_overrides(body)
             started = time.time()
 
-            if stream and _real_streaming_enabled():
+            if native_tools:
+                # Native tool-call emulation must inspect Claude's final JSON
+                # envelope before responding, so buffer the CLI call. For
+                # stream:true clients, emit standard OpenAI tool-call SSE chunks
+                # after parsing instead of token text deltas.
+                outcome = run_claude(prompt, model, engine=False, overrides=overrides)
+                tool_calls = [] if outcome["error"] else extract_native_tool_calls(outcome["text"], tools)
+                if tool_calls:
+                    if stream:
+                        self._stream_tool_call_response(model, tool_calls, outcome["usage"], include_usage)
+                    else:
+                        self._send_json(200, build_tool_call_completion(model, tool_calls, outcome["usage"]))
+                else:
+                    if stream:
+                        self._stream_response(model, outcome, include_usage)
+                    else:
+                        self._send_json(200, build_completion(model, outcome["text"], outcome["usage"]))
+            elif stream and _real_streaming_enabled():
                 outcome = self._stream_live_response(model, prompt, engine, overrides, include_usage)
             else:
                 outcome = run_claude(prompt, model, engine, overrides)
@@ -1050,8 +1273,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(200, build_completion(model, outcome["text"], outcome["usage"]))
 
             self.log_message(
-                "model=%s engine=%s stream=%s live_stream=%s images=%s effort=%s %.1fs %s",
-                model, engine, stream, bool(stream and _real_streaming_enabled()), images.count,
+                "model=%s engine=%s native_tools=%s stream=%s live_stream=%s images=%s effort=%s %.1fs %s",
+                model, engine, native_tools, stream,
+                bool(stream and _real_streaming_enabled() and not native_tools), images.count,
                 overrides.get("effort") or _env("CLAUDE_CODE_CLI_EFFORT", "high"),
                 time.time() - started, "error" if outcome["error"] else "ok",
             )
@@ -1079,6 +1303,21 @@ class Handler(BaseHTTPRequestHandler):
             self._write_sse("[DONE]")
         except (BrokenPipeError, ConnectionResetError):
             pass  # client hung up mid-stream
+
+    def _stream_tool_call_response(self, model: str, tool_calls: list[dict],
+                                   usage: dict, include_usage: bool) -> None:
+        """Buffered SSE response for native Hermes tool calls."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            for chunk in build_tool_call_stream_chunks(model, tool_calls, usage, include_usage):
+                self._write_sse(chunk)
+            self._write_sse("[DONE]")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _stream_live_response(self, model: str, prompt: str, engine: bool,
                               overrides: dict, include_usage: bool) -> dict:

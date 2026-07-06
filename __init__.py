@@ -22,9 +22,9 @@ The shim must be running for chat to work - start it with::
 
     ~/.hermes/plugins/model-providers/claude-code-cli/start.sh
 
-See ``README.md`` in this directory for the full contract, env-var overrides,
-and the advisory/text-completion caveat (the CLI runs its own tool loop, so
-this provider returns final text, not OpenAI-style ``tool_calls``).
+See ``README.md`` in this directory for the full contract and env-var
+overrides, including Hermes-native ``tool_calls`` emulation and explicit
+Claude Code engine mode.
 """
 
 from providers import register_provider
@@ -42,8 +42,8 @@ claude_code_cli = ProviderProfile(
     api_mode="chat_completions",
     display_name="Claude Code (local CLI)",
     description=(
-        "Local Claude Code CLI via on-device shim (claude -p) - advisory / "
-        "text completions, no API key or network egress"
+        "Local Claude Code CLI via on-device shim (claude -p) - chat, "
+        "streaming, vision, Hermes tool calls, and explicit engine mode"
     ),
     signup_url="",
     # First var = the (ignored) API key the local shim accepts; second var
