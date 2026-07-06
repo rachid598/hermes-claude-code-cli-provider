@@ -1,10 +1,10 @@
 # Core patches (apply to `hermes-agent`, not this plugin)
 
 These implement the Hermes-**core** half of the Codex-parity integration (#9).
-Each is **opt-in and default-off** — applying the patch changes no behavior until
+Each is **opt-in and default-off** - applying the patch changes no behavior until
 you set the config flag.
 
-## `p1-claude-stream-runtime.patch` — P1: opt-in `claude_stream` api_mode
+## `p1-claude-stream-runtime.patch` - P1: opt-in `claude_stream` api_mode
 A persistent Claude Code stream-json session as the turn runtime, mirroring the
 existing `codex_app_server` integration. New files
 (`agent/transports/claude_stream_session.py`, `agent/claude_stream_runtime.py`)

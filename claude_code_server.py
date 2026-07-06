@@ -6,7 +6,7 @@ minimal OpenAI Chat Completions surface and, for each request, shells out to::
 
     claude -p --output-format json --model <model> [--effort ..] [--tools ..] ...
 
-then returns the CLI's ``result`` field as the assistant message — the same way
+then returns the CLI's ``result`` field as the assistant message - the same way
 the ``fusion-consult`` skill drives Claude Code as an advisory worker. No
 Anthropic API key and no network egress are involved; everything runs through
 your local, already-authenticated Claude Code login.
@@ -138,7 +138,7 @@ def resolve_claude_bin() -> str:
 # Vision passthrough (#4): claude -p is blind to inline OpenAI image parts, so
 # we materialize base64 `data:` images to temp files and reference their paths
 # in the prompt (Claude Code's Read tool can open image files in engine mode).
-# Remote URLs are passed through as text references — the shim intentionally
+# Remote URLs are passed through as text references - the shim intentionally
 # performs no network egress, so it never downloads them itself.
 _DATA_URL_RE = re.compile(
     r"^data:(?P<mime>[\w.+-]+/[\w.+-]+)?(?P<b64>;base64)?,(?P<data>.*)$", re.DOTALL
@@ -242,12 +242,12 @@ class _ImageCollector:
                 return f"[image omitted: {exc}]"
             self.count += 1
             self.paths.append(path)
-            return f"[image saved to {path} — read this file to view the image]"
+            return f"[image saved to {path} - read this file to view the image]"
         # Non-data reference: pass it through as text so an engine-mode agent can
         # fetch it (WebFetch) if it chooses. The shim itself does not download.
         if url.startswith(("http://", "https://", "file://", "/")):
             self.count += 1
-            return f"[image at {url} — fetch this URL/path to view the image]"
+            return f"[image at {url} - fetch this URL/path to view the image]"
         return "[image omitted: unsupported image reference]"
 
     def cleanup(self) -> None:
@@ -380,7 +380,7 @@ def extract_overrides(body: object) -> dict:
 
     Only keys that are actually present (and non-empty) are returned, so callers
     can treat a missing key as "fall back to the env default". This is parsed
-    defensively — a malformed field is ignored rather than raising, keeping a
+    defensively - a malformed field is ignored rather than raising, keeping a
     single bad request from breaking the shim. Recognised inputs:
 
     * ``reasoning_effort`` (top-level) or ``extra_body.reasoning.effort``
@@ -435,8 +435,8 @@ def build_claude_argv(model: str, engine: bool, overrides: dict | None = None,
     """Assemble the `claude -p` argv from config. Prompt is piped via stdin.
 
     engine=True  → Claude Code uses its OWN tools to actually do the work
-                   (read/edit files, run bash) — "use Claude Code as an engine".
-    engine=False → no tools, single turn — a plain text model (aux tasks).
+                   (read/edit files, run bash) - "use Claude Code as an engine".
+    engine=False → no tools, single turn - a plain text model (aux tasks).
 
     ``overrides`` (from :func:`extract_overrides`) lets a single request tune
     effort / max-turns / tool lists; any key it omits falls back to the env
@@ -721,7 +721,7 @@ def _extract_result_event(event: dict):
     """Return ``(text, usage, error)`` for a terminal event, else ``None``.
 
     Recognizes the stream-json ``{"type":"result",...}`` event *and*, defensively,
-    a bare ``{"result": ..., "usage": ...}`` blob — some CLI versions ignore
+    a bare ``{"result": ..., "usage": ...}`` blob - some CLI versions ignore
     ``--output-format stream-json`` and emit a single JSON object, and we still
     want a usable final result + usage in that case.
     """
@@ -1034,7 +1034,7 @@ class Handler(BaseHTTPRequestHandler):
                 prompt += (
                     "\n\nYou are operating as an autonomous coding engine with your own tools "
                     "(Read, Write, Edit, Bash, Glob, Grep, etc.) in your working directory. Use "
-                    "them to actually carry out the task — read/modify files, run commands — then "
+                    "them to actually carry out the task - read/modify files, run commands - then "
                     "report what you did. Do not ask for permission; act."
                 )
             overrides = extract_overrides(body)

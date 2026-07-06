@@ -7,7 +7,7 @@ set -euo pipefail
 # per-invocation provider/env overrides. It never requires real Claude Code auth
 # and should never start the real /usr/bin/claude shim.
 
-PROFILE="${1:-${HERMES_CLAUDE_CODE_PROFILE:-claudecli}}"
+PROFILE="${1:-${HERMES_CLAUDE_CODE_PROFILE:-claude-code-cli-smoke}}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-python3}"
 

@@ -3,7 +3,7 @@
 Imported by ``__init__.py`` at provider-discovery time. If this Hermes is
 actually configured to use the ``claude-code-cli`` provider (as the main model
 or any auxiliary task) and the shim isn't already listening, spawn it detached
-so the provider "just works" without a manual ``start.sh`` — the #1 sharp edge
+so the provider "just works" without a manual ``start.sh`` - the #1 sharp edge
 (a stopped shim after a reboot silently breaks the provider).
 
 Design goals: never raise, never block when the shim is already up, and only
@@ -147,7 +147,7 @@ def _acquire_lock(ttl: float = 30.0) -> pathlib.Path | None:
     except FileExistsError:
         return None  # someone else is starting it
     except OSError:
-        return lock  # lock fs unavailable — proceed without it
+        return lock  # lock fs unavailable - proceed without it
 
 
 def _child_env(host: str, port: int) -> dict[str, str]:
@@ -197,7 +197,7 @@ def ensure_server_running(wait_seconds: float = 4.0) -> bool:
 
         lock = _acquire_lock()
         if lock is None:
-            # another importer is starting it — just wait for it to come up
+            # another importer is starting it - just wait for it to come up
             deadline = time.monotonic() + wait_seconds
             while time.monotonic() < deadline:
                 if _is_up(host, port):

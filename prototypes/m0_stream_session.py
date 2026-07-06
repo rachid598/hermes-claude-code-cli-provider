@@ -3,8 +3,8 @@
 
 Proves the primitive behind a Codex-parity integration: running `claude` with
 `--output-format stream-json --verbose` lets a host observe the agent's full
-event stream — system/init, assistant text, `tool_use`, tool results, and a
-final `result` carrying usage + cost — on the Claude Code subscription (no API
+event stream - system/init, assistant text, `tool_use`, tool results, and a
+final `result` carrying usage + cost - on the Claude Code subscription (no API
 key). Multi-turn input via `--input-format stream-json` is M1; this M0 driver
 uses a single positional prompt to validate the OUTPUT taxonomy + billing fields
 that M2 (event mapping) would consume.

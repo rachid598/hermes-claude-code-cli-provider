@@ -273,7 +273,7 @@ class PerRequestOverrideTests(unittest.TestCase):
         self.assertEqual(server.extract_overrides(body)["max_turns"], "7")
 
     def test_max_turns_bool_is_rejected(self):
-        # bool is an int subclass — must not leak True/False as "1"/"0".
+        # bool is an int subclass - must not leak True/False as "1"/"0".
         self.assertNotIn("max_turns", server.extract_overrides({"extra_body": {"max_turns": True}}))
 
     def test_max_turns_negative_and_nonnumeric_rejected(self):
