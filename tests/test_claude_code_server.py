@@ -842,6 +842,170 @@ emit({"type": "result", "result": "onetwo", "usage": {"input_tokens": 1, "output
         self.assertIn("data: [DONE]", body)
 
 
+class ProviderErrorHTTPTests(unittest.TestCase):
+    """Claude failures must be OpenAI errors, never successful completions."""
+
+    @contextlib.contextmanager
+    def _server(self, fake: pathlib.Path, **env):
+        values = {
+            "CLAUDE_CODE_CLI_BIN": str(fake),
+            "CLAUDE_CODE_CLI_TIMEOUT": "5",
+            "CLAUDE_CODE_CLI_STREAM": "1",
+        }
+        values.update(env)
+        with temporary_env(**values):
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                yield f"http://127.0.0.1:{httpd.server_address[1]}"
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=5)
+
+    def _request(self, base: str, *, stream: bool = False):
+        return request.Request(
+            base + "/v1/chat/completions",
+            data=json.dumps({
+                "model": "sonnet",
+                "stream": stream,
+                "messages": [{"role": "user", "content": "probe"}],
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+    def _http_error(self, base: str, *, stream: bool = False):
+        with self.assertRaises(error.HTTPError) as cm:
+            request.urlopen(self._request(base, stream=stream), timeout=5)
+        exc = cm.exception
+        body = json.loads(exc.read().decode("utf-8"))
+        exc.close()
+        return exc.code, body
+
+    def test_error_classification_matrix(self):
+        cases = [
+            ({"api_error_status": 400, "subtype": "invalid_request_error"}, "bad request", 400),
+            ({"api_error_status": 401, "subtype": "authentication_error"}, "oauth expired", 401),
+            ({"api_error_status": 403}, "subscription forbidden", 403),
+            ({"api_error_status": 429}, "usage limit", 429),
+            ({"api_error_status": 503}, "temporarily unavailable", 503),
+            ({}, "network connection failed", 502),
+            ({}, "unknown real failure", 500),
+        ]
+        for structured, message, expected in cases:
+            with self.subTest(message=message):
+                info = server._classify_cli_error(message, structured=structured)
+                self.assertEqual(info["status"], expected)
+
+    def test_nonzero_exit_is_not_http_200(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import sys
+sys.stdin.read()
+print("unknown provider failure", file=sys.stderr)
+sys.exit(42)
+""")
+            with self._server(fake) as base:
+                status, body = self._http_error(base)
+        self.assertEqual(status, 500)
+        self.assertEqual(body["error"]["code"], "provider_internal_error")
+        self.assertNotIn("choices", body)
+
+    def test_structured_auth_error_is_401(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({"is_error": True, "api_error_status": 401, "subtype": "authentication_error", "result": "OAuth expired"}))
+""")
+            with self._server(fake) as base:
+                status, body = self._http_error(base)
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["type"], "authentication_error")
+
+    def test_structured_rate_limit_is_429(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({"is_error": True, "api_error_status": 429, "subtype": "rate_limit_error", "result": "usage limit reached"}))
+""")
+            with self._server(fake) as base:
+                status, body = self._http_error(base)
+        self.assertEqual(status, 429)
+        self.assertEqual(body["error"]["code"], "rate_limit_exceeded")
+
+    def test_timeout_is_504(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import sys, time
+sys.stdin.read()
+time.sleep(2)
+""")
+            with self._server(fake, CLAUDE_CODE_CLI_TIMEOUT="1") as base:
+                status, body = self._http_error(base)
+        self.assertEqual(status, 504)
+        self.assertEqual(body["error"]["type"], "timeout_error")
+
+    def test_temporary_upstream_error_is_503(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({"is_error": True, "api_error_status": 503, "result": "backend temporarily unavailable"}))
+""")
+            with self._server(fake) as base:
+                status, body = self._http_error(base)
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["type"], "upstream_error")
+
+    def test_pre_header_sse_error_uses_real_http_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({"type": "result", "is_error": True, "api_error_status": 429, "result": "quota exceeded"}), flush=True)
+""")
+            with self._server(fake) as base:
+                status, body = self._http_error(base, stream=True)
+        self.assertEqual(status, 429)
+        self.assertEqual(body["error"]["code"], "rate_limit_exceeded")
+
+    def test_post_header_sse_error_is_not_success_completion(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "partial"}}}), flush=True)
+print(json.dumps({"type": "result", "is_error": True, "api_error_status": 503, "result": "upstream unavailable"}), flush=True)
+""")
+            with self._server(fake) as base:
+                with request.urlopen(self._request(base, stream=True), timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)  # headers were already committed
+                    body = resp.read().decode("utf-8")
+        self.assertIn('"error"', body)
+        self.assertIn('"code": "upstream_unavailable"', body)
+        self.assertNotIn('"finish_reason": "stop"', body)
+        self.assertNotIn("data: [DONE]", body)
+
+    def test_error_response_redacts_secrets_and_sensitive_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = make_fake_claude(pathlib.Path(td), """#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({"is_error": True, "api_error_status": 401, "result": "Authorization: Bearer secret-token ANTHROPIC_API_KEY=sk-ant-secret /home/alice/private"}))
+""")
+            with self._server(fake) as base:
+                _, body = self._http_error(base)
+        rendered = json.dumps(body)
+        self.assertNotIn("secret-token", rendered)
+        self.assertNotIn("sk-ant-secret", rendered)
+        self.assertNotIn("/home/alice", rendered)
+        self.assertIn("[REDACTED]", rendered)
+
+
 class ManagedServiceTests(unittest.TestCase):
     """Issue #2: opt-in service templates and helpers are shipped but not run."""
 

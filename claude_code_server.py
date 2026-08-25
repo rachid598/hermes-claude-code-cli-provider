@@ -698,6 +698,134 @@ def _extract_json_object(text: str) -> dict | None:
         return None
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+"),
+    re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"(?i)\b(sk-(?:ant-)?[A-Za-z0-9_-]{6,})\b"),
+    re.compile(
+        r"(?i)\b((?:ANTHROPIC_(?:API_KEY|AUTH_TOKEN|TOKEN)|CLAUDE_CODE_OAUTH_TOKEN)\s*=\s*)[^\s,;]+"
+    ),
+)
+
+
+def _sanitize_error_message(message: object) -> str:
+    """Return a bounded provider error safe for HTTP responses and logs."""
+    text = _ANSI_ESCAPE_RE.sub("", str(message or "Claude Code CLI failed"))
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(lambda m: (m.group(1) if m.lastindex else "") + "[REDACTED]", text)
+    text = re.sub(r"(?<![A-Za-z0-9_.-])/home/[^/\s]+", "~", text)
+    text = re.sub(r"(?<![A-Za-z0-9_.-])/Users/[^/\s]+", "~", text)
+    text = " ".join(text.split())
+    return (text[:997] + "...") if len(text) > 1000 else text
+
+
+def _structured_status(structured: object) -> int | None:
+    if not isinstance(structured, dict):
+        return None
+    candidates = [
+        structured.get("api_error_status"),
+        structured.get("status_code"),
+        structured.get("status"),
+    ]
+    nested = structured.get("error")
+    if isinstance(nested, dict):
+        candidates.extend((nested.get("status"), nested.get("status_code"), nested.get("http_status")))
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            status = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 400 <= status <= 599:
+            return status
+    return None
+
+
+def _classify_cli_error(message: object, *, structured: object = None,
+                        failure_kind: str = "") -> dict:
+    """Map a real Claude CLI failure to an OpenAI-compatible HTTP error.
+
+    Structured status/subtype information wins. Text matching is deliberately
+    last-resort for CLI versions that only write human-readable stderr.
+    """
+    clean = _sanitize_error_message(message)
+    low = clean.lower()
+    status = _structured_status(structured)
+    subtype = ""
+    if isinstance(structured, dict):
+        subtype = str(structured.get("subtype") or structured.get("type") or "").lower()
+        nested = structured.get("error")
+        if not subtype and isinstance(nested, dict):
+            subtype = str(nested.get("type") or nested.get("code") or "").lower()
+
+    if failure_kind == "timeout":
+        status = 504
+    elif status is None:
+        # Last-resort text taxonomy for CLI releases without structured status.
+        if any(p in low for p in (
+            "not logged in", "not authenticated", "authentication_error",
+            "oauth expired", "oauth token", "please run /login", "please login",
+            "invalid api key", "unauthorized",
+        )):
+            status = 401
+        elif any(p in low for p in ("forbidden", "subscription required", "access denied", "permission denied")):
+            status = 403
+        elif any(p in low for p in (
+            "rate limit", "rate_limit", "quota exceeded", "usage limit",
+            "too many requests", "capacity limit",
+        )):
+            status = 429
+        elif any(p in low for p in ("model not found", "unknown model", "invalid model", "model does not exist")):
+            status = 404
+        elif any(p in low for p in ("invalid request", "invalid argument", "invalid parameter", "bad request")):
+            status = 400
+        elif any(p in low for p in (
+            "temporarily unavailable", "service unavailable", "backend unavailable",
+            "overloaded", "upstream unavailable",
+        )):
+            status = 503
+        elif any(p in low for p in (
+            "network error", "network connection", "connection failed",
+            "connection refused", "connection reset", "dns", "econn",
+        )):
+            status = 502
+        else:
+            status = 500
+
+    if status in (401, 403) or "auth" in subtype:
+        etype, code = "authentication_error", (
+            "permission_denied" if status == 403 else "authentication_failed"
+        )
+    elif status == 429:
+        etype, code = "rate_limit_error", "rate_limit_exceeded"
+    elif status == 504:
+        etype, code = "timeout_error", "timeout"
+    elif status in (502, 503):
+        etype, code = "upstream_error", (
+            "upstream_unavailable" if status == 503 else "upstream_connection_error"
+        )
+    elif 400 <= status < 500:
+        etype = "invalid_request_error"
+        code = "model_not_found" if status == 404 else "invalid_request"
+    else:
+        status, etype, code = 500, "internal_error", "provider_internal_error"
+
+    return {"status": status, "type": etype, "code": code, "message": clean}
+
+
+def _failure_outcome(message: object, usage: dict | None = None, *,
+                     structured: object = None, failure_kind: str = "") -> dict:
+    info = _classify_cli_error(message, structured=structured, failure_kind=failure_kind)
+    return {
+        "text": "[claude-code-cli error] " + info["message"],
+        "usage": usage or _zero_usage(),
+        "error": info["message"],
+        "http_error": info,
+    }
+
+
 def run_claude(prompt: str, model: str, engine: bool = False, overrides: dict | None = None) -> dict:
     """Invoke `claude -p` and return {text, usage, error}.
 
@@ -729,40 +857,47 @@ def run_claude(prompt: str, model: str, engine: bool = False, overrides: dict | 
             check=False,
         )
     except FileNotFoundError:
-        msg = f"claude binary not found (tried {argv[0]!r}); set CLAUDE_CODE_CLI_BIN"
-        return {"text": f"[claude-code-cli error] {msg}", "usage": _zero_usage(), "error": msg}
+        return _failure_outcome("Claude Code executable not found", failure_kind="internal")
     except subprocess.TimeoutExpired:
         msg = f"claude timed out after {timeout}s"
-        return {"text": f"[claude-code-cli error] {msg}", "usage": _zero_usage(), "error": msg}
+        return _failure_outcome(msg, failure_kind="timeout")
     except Exception as exc:  # defensive: never crash the request thread
         msg = f"claude invocation failed: {exc!r}"
-        return {"text": f"[claude-code-cli error] {msg}", "usage": _zero_usage(), "error": msg}
+        return _failure_outcome(msg, failure_kind="internal")
 
     stdout, stderr = proc.stdout or "", proc.stderr or ""
     parsed = _extract_json_object(stdout)
 
+    # Exit status is authoritative: even a parseable stdout result cannot turn
+    # a failed process into a successful completion.
+    if proc.returncode != 0:
+        structured_message = ""
+        if isinstance(parsed, dict):
+            structured_message = str(parsed.get("result") or parsed.get("error") or "")
+        detail = structured_message or stderr.strip() or stdout.strip() or f"Claude exited with status {proc.returncode}"
+        return _failure_outcome(
+            f"claude exited {proc.returncode}: {detail}",
+            _map_usage(parsed.get("usage")) if isinstance(parsed, dict) else _zero_usage(),
+            structured=parsed,
+        )
+
     if parsed is not None:
         if parsed.get("is_error"):
-            msg = str(parsed.get("result") or parsed.get("error") or "claude reported is_error")
-            return {"text": f"[claude-code-cli error] {msg}", "usage": _map_usage(parsed.get("usage")), "error": msg}
+            msg = str(parsed.get("result") or parsed.get("error") or "claude reported an error")
+            return _failure_outcome(msg, _map_usage(parsed.get("usage")), structured=parsed)
         result = parsed.get("result")
         if not isinstance(result, str):
             result = parsed.get("content")
         if isinstance(result, str) and result.strip():
             return {"text": result.strip(), "usage": _map_usage(parsed.get("usage")), "error": ""}
 
-    # Non-zero exit with no parseable result → surface stderr/stdout tail.
-    if proc.returncode != 0:
-        tail = (stderr.strip() or stdout.strip())[-1000:]
-        msg = f"claude exited {proc.returncode}: {tail}"
-        return {"text": f"[claude-code-cli error] {msg}", "usage": _zero_usage(), "error": msg}
 
     # Exit 0 but unparseable → degrade to raw stdout as the completion text.
     fallback = stdout.strip()
     if fallback:
         return {"text": fallback, "usage": _zero_usage(), "error": ""}
     msg = "claude returned no output"
-    return {"text": f"[claude-code-cli error] {msg}", "usage": _zero_usage(), "error": msg}
+    return _failure_outcome(msg)
 
 
 def _zero_usage() -> dict:
@@ -865,7 +1000,7 @@ def _extract_assistant_message_text(event: dict) -> str:
 
 
 def _extract_result_event(event: dict):
-    """Return ``(text, usage, error)`` for a terminal event, else ``None``.
+    """Return ``(text, usage, error, structured_event)`` or ``None``.
 
     Recognizes the stream-json ``{"type":"result",...}`` event *and*, defensively,
     a bare ``{"result": ..., "usage": ...}`` blob - some CLI versions ignore
@@ -878,10 +1013,10 @@ def _extract_result_event(event: dict):
         return None
     if event.get("is_error"):
         msg = str(event.get("result") or event.get("error") or "claude reported is_error")
-        return ("", _map_usage(event.get("usage")), msg)
+        return ("", _map_usage(event.get("usage")), msg, event)
     text = event.get("result")
     text = text if isinstance(text, str) else str(event.get("content") or "")
-    return (text, _map_usage(event.get("usage")), "")
+    return (text, _map_usage(event.get("usage")), "", event)
 
 
 def _kill_proc(proc) -> None:
@@ -926,12 +1061,11 @@ def stream_claude(prompt: str, model: str, engine: bool = False,
             bufsize=1,
         )
     except FileNotFoundError:
-        msg = f"claude binary not found (tried {argv[0]!r}); set CLAUDE_CODE_CLI_BIN"
-        yield ("final", {"text": f"[claude-code-cli error] {msg}", "usage": _zero_usage(), "error": msg})
+        yield ("final", _failure_outcome("Claude Code executable not found", failure_kind="internal"))
         return
     except Exception as exc:  # defensive: never crash the request thread
         msg = f"claude invocation failed: {exc!r}"
-        yield ("final", {"text": f"[claude-code-cli error] {msg}", "usage": _zero_usage(), "error": msg})
+        yield ("final", _failure_outcome(msg, failure_kind="internal"))
         return
 
     def _feed():
@@ -977,6 +1111,7 @@ def stream_claude(prompt: str, model: str, engine: bool = False,
     result_text = ""
     result_usage = _zero_usage()
     result_error = ""
+    result_structured: dict | None = None
     saw_result = False
 
     try:
@@ -999,7 +1134,7 @@ def stream_claude(prompt: str, model: str, engine: bool = False,
             else:
                 parsed = _extract_result_event(event)
                 if parsed is not None:
-                    result_text, result_usage, result_error = parsed
+                    result_text, result_usage, result_error, result_structured = parsed
                     saw_result = True
     finally:
         try:
@@ -1021,16 +1156,23 @@ def stream_claude(prompt: str, model: str, engine: bool = False,
 
     if timed_out["flag"]:
         msg = f"claude timed out after {timeout}s"
-        text = emitted_text or f"[claude-code-cli error] {msg}"
-        yield ("final", {"text": text, "usage": result_usage, "error": msg})
+        yield ("final", _failure_outcome(msg, result_usage, failure_kind="timeout"))
         return
 
     if result_error:
-        if not emitted_any:
-            err_line = f"[claude-code-cli error] {result_error}"
-            emitted_text = err_line
-            yield ("delta", err_line)
-        yield ("final", {"text": emitted_text, "usage": result_usage, "error": result_error})
+        yield ("final", _failure_outcome(
+            result_error, result_usage, structured=result_structured,
+        ))
+        return
+
+    # A non-zero process status is a failure even if partial text or a nominal
+    # result event was emitted before the process terminated.
+    if proc.returncode not in (0, None):
+        detail = stderr_tail or result_text or emitted_text or f"Claude exited with status {proc.returncode}"
+        yield ("final", _failure_outcome(
+            f"claude exited {proc.returncode}: {detail}", result_usage,
+            structured=result_structured,
+        ))
         return
 
     final_text = result_text or emitted_text or assistant_text
@@ -1044,9 +1186,7 @@ def stream_claude(prompt: str, model: str, engine: bool = False,
             msg = f"claude exited {rc}: {stderr_tail}" if stderr_tail else f"claude exited {rc}"
         else:
             msg = "claude returned no output"
-        err_line = f"[claude-code-cli error] {msg}"
-        yield ("delta", err_line)
-        yield ("final", {"text": err_line, "usage": _zero_usage(), "error": msg})
+        yield ("final", _failure_outcome(msg))
         return
 
     yield ("final", {"text": final_text, "usage": result_usage, "error": ""})
@@ -1170,6 +1310,21 @@ class Handler(BaseHTTPRequestHandler):
     def _send_error(self, status: int, message: str, etype: str = "invalid_request_error") -> None:
         self._send_json(status, {"error": {"message": message, "type": etype}})
 
+    def _send_cli_failure(self, outcome: dict) -> None:
+        """Expose a Claude CLI failure as an OpenAI error with a real status."""
+        info = outcome.get("http_error") if isinstance(outcome, dict) else None
+        if not isinstance(info, dict):
+            info = _classify_cli_error(
+                outcome.get("error") if isinstance(outcome, dict) else "Claude Code CLI failed"
+            )
+        self._send_json(int(info.get("status") or 500), {
+            "error": {
+                "message": _sanitize_error_message(info.get("message")),
+                "type": str(info.get("type") or "internal_error"),
+                "code": str(info.get("code") or "provider_internal_error"),
+            }
+        })
+
     def log_message(self, fmt, *args):  # quieter, single-line logs to stderr
         sys.stderr.write("[claude-code-cli] " + (fmt % args) + "\n")
 
@@ -1252,25 +1407,31 @@ class Handler(BaseHTTPRequestHandler):
                 # stream:true clients, emit standard OpenAI tool-call SSE chunks
                 # after parsing instead of token text deltas.
                 outcome = run_claude(prompt, model, engine=False, overrides=overrides)
-                tool_calls = [] if outcome["error"] else extract_native_tool_calls(outcome["text"], tools)
-                if tool_calls:
-                    if stream:
-                        self._stream_tool_call_response(model, tool_calls, outcome["usage"], include_usage)
+                if outcome["error"]:
+                    self._send_cli_failure(outcome)
+                else:
+                    tool_calls = extract_native_tool_calls(outcome["text"], tools)
+                    if tool_calls:
+                        if stream:
+                            self._stream_tool_call_response(model, tool_calls, outcome["usage"], include_usage)
+                        else:
+                            self._send_json(200, build_tool_call_completion(model, tool_calls, outcome["usage"]))
                     else:
-                        self._send_json(200, build_tool_call_completion(model, tool_calls, outcome["usage"]))
+                        if stream:
+                            self._stream_response(model, outcome, include_usage)
+                        else:
+                            self._send_json(200, build_completion(model, outcome["text"], outcome["usage"]))
+            elif stream and _real_streaming_enabled():
+                outcome = self._stream_live_response(model, prompt, engine, overrides, include_usage)
+            else:
+                outcome = run_claude(prompt, model, engine, overrides)
+                if outcome["error"]:
+                    self._send_cli_failure(outcome)
                 else:
                     if stream:
                         self._stream_response(model, outcome, include_usage)
                     else:
                         self._send_json(200, build_completion(model, outcome["text"], outcome["usage"]))
-            elif stream and _real_streaming_enabled():
-                outcome = self._stream_live_response(model, prompt, engine, overrides, include_usage)
-            else:
-                outcome = run_claude(prompt, model, engine, overrides)
-                if stream:
-                    self._stream_response(model, outcome, include_usage)
-                else:
-                    self._send_json(200, build_completion(model, outcome["text"], outcome["usage"]))
 
             self.log_message(
                 "model=%s engine=%s native_tools=%s stream=%s live_stream=%s images=%s effort=%s %.1fs %s",
@@ -1323,6 +1484,7 @@ class Handler(BaseHTTPRequestHandler):
                               overrides: dict, include_usage: bool) -> dict:
         """SSE bridge for real `stream-json` deltas (#3)."""
         cid, created = _completion_id(), int(time.time())
+        headers_sent = False
 
         def chunk(delta, finish=None, usage_obj=None):
             payload = {
@@ -1336,20 +1498,45 @@ class Handler(BaseHTTPRequestHandler):
                 payload["usage"] = usage_obj
             return payload
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
+        def open_stream() -> None:
+            nonlocal headers_sent
+            if headers_sent:
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            headers_sent = True
+            self._write_sse(chunk({"role": "assistant"}))
+
         outcome = {"text": "", "usage": _zero_usage(), "error": "stream ended before final event"}
         try:
-            self._write_sse(chunk({"role": "assistant"}))
             for kind, payload in stream_claude(prompt, model, engine, overrides):
                 if kind == "delta":
+                    open_stream()
                     self._write_sse(chunk({"content": payload}))
                 elif kind == "final" and isinstance(payload, dict):
                     outcome = payload
                     break
+
+            if outcome["error"]:
+                if not headers_sent:
+                    self._send_cli_failure(outcome)
+                else:
+                    # HTTP status is immutable after the first delta. Emit an
+                    # OpenAI error event, omit finish_reason=stop and [DONE],
+                    # then close so clients cannot mistake this for success.
+                    info = outcome.get("http_error") or _classify_cli_error(outcome["error"])
+                    self._write_sse({"error": {
+                        "message": _sanitize_error_message(info.get("message")),
+                        "type": str(info.get("type") or "internal_error"),
+                        "code": str(info.get("code") or "provider_internal_error"),
+                    }})
+                    self.close_connection = True
+                return outcome
+
+            open_stream()
             self._write_sse(chunk({}, finish="stop"))
             if include_usage:
                 self._write_sse({
